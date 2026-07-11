@@ -1,0 +1,18 @@
+[package]
+name = "capivara"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Rust-idiomatic async job/worker library (Celery-like topology, typed Task API)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DavillyDevTeam/capivara-rs"
+readme = "README.md"
+keywords = ["queue", "worker", "jobs", "async", "tokio"]
+categories = ["asynchronous", "network-programming"]
+authors = ["Duarte Mainart Tecnologia e Publicidade LTDA"]
+
+[dependencies]
+
+[lib]
+name = "capivara"
+path = "src/lib.rs"
