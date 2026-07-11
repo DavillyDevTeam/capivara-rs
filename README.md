@@ -1,33 +1,72 @@
 # capivara
 
-> **Under construction — not released.**  
-> Do not use this crate in production yet. APIs will change without notice until `0.1.0`.
+> **Under construction — not production-released.**  
+> APIs may change until a formal release is announced.
 
 **capivara** is a Rust-idiomatic **job / worker library** with a Celery-like *topology*
-(enqueue → broker → worker → optional results), not a Celery clone or a universal CLI.
+(enqueue → broker → worker → optional results). It is **not** a Celery clone and **not**
+a universal CLI that runs arbitrary remote code.
 
 | | |
 |---|---|
-| **Package** | `capivara` (this repo: `capivara-rs`) |
+| **Package** | `capivara` (repo: `capivara-rs`) |
 | **Org** | [DavillyDevTeam](https://github.com/DavillyDevTeam) |
 | **License** | MIT OR Apache-2.0 |
 
-## Status (M0)
+## What works today (M0)
 
-- [x] Public repository, dual license, CI skeleton  
-- [ ] Typed `Task` trait, in-memory broker & results, worker loop (next PR)  
-- [ ] Redis broker (later milestone)  
+- Typed **`Task`** trait (`NAME`, `Args`, `Output`, async `run`)
+- **`App::register` / `send` / `run_worker` / `get_result`**
+- **`MemoryBroker`** + optional **`MemoryResultBackend`** (in-process only)
+- Panic isolation at the task boundary
+- CI: fmt, clippy, tests
 
-## Intended use (preview)
+## Not yet
 
-Applications depend on this library, define work as types implementing `Task`,
-register them, enqueue typed payloads, and run a worker in **their** binary.
+- Redis / multi-process workers  
+- Retries, DLQ, leases  
+- Proc-macro / `app.task("name", fn)` sugar  
 
-```text
-impl Task for Add { const NAME: &str = "add"; type Args = ...; type Output = ...; async fn run(...) }
-app.register::<Add>()?;
-let id = app.send::<Add>(&args).await?;
-// optional: app.get_result(id).await?
+## Quick example
+
+```rust
+use capivara::{App, JobResult, MemoryBroker, MemoryResultBackend, Task, TaskError};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct AddArgs { x: i32, y: i32 }
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct AddResult { sum: i32 }
+
+struct Add;
+
+impl Task for Add {
+    const NAME: &'static str = "add";
+    type Args = AddArgs;
+    type Output = AddResult;
+
+    async fn run(args: Self::Args) -> Result<Self::Output, TaskError> {
+        Ok(AddResult { sum: args.x + args.y })
+    }
+}
+
+#[tokio::main]
+async fn main() -> capivara::Result<()> {
+    let app = App::new(MemoryBroker::new())
+        .with_result_backend(MemoryResultBackend::new());
+    app.register::<Add>().await?;
+    let id = app.send::<Add>(&AddArgs { x: 2, y: 3 }).await?;
+    app.run_worker(None).await?;
+    match app.get_result(id).await? {
+        JobResult::Success { payload } => {
+            let out: AddResult = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(out.sum, 5);
+        }
+        JobResult::Failure { message } => panic!("{message}"),
+    }
+    Ok(())
+}
 ```
 
 ## Development
@@ -36,18 +75,13 @@ let id = app.send::<Add>(&args).await?;
 cargo test
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-```
-
-Install git hooks (optional, recommended):
-
-```bash
-pre-commit install
+pre-commit install   # optional
 pre-commit run --all-files
 ```
 
 ## Security
 
-See [SECURITY.md](SECURITY.md). Please use GitHub Private Vulnerability Reporting.
+See [SECURITY.md](SECURITY.md) — use GitHub Private Vulnerability Reporting.
 
 ## Contributing
 
