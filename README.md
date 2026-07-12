@@ -1,6 +1,7 @@
 # capivara
 
 > **Under construction — not production-released.**  
+> Version **`0.0.1`** with **`publish = false`** (will not publish to crates.io by accident).  
 > APIs may change until a formal release is announced.
 
 **capivara** is a Rust-idiomatic **job / worker library** with a Celery-like *topology*

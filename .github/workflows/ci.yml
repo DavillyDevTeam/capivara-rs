@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: contents read for checkout; actions write so rust-cache can save.
+permissions:
+  contents: read
+  actions: write
+
+# One active run per workflow+ref; cancel superseded pushes on the same PR/branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"

@@ -1,7 +1,8 @@
 [package]
 name = "capivara"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
+publish = false
 rust-version = "1.85"
 description = "Rust-idiomatic async job/worker library (Celery-like topology, typed Task API)"
 license = "MIT OR Apache-2.0"
