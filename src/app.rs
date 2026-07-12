@@ -42,6 +42,14 @@ impl App {
         self
     }
 
+    /// Shared broker handle (same instance the app uses for `send` / worker).
+    ///
+    /// Useful for tests and advanced injection (e.g. enqueue a raw [`Job`] that
+    /// bypasses typed [`Self::send`]).
+    pub fn broker(&self) -> Arc<dyn Broker> {
+        Arc::clone(&self.broker)
+    }
+
     /// Register a typed task. Duplicate [`Task::NAME`] is an error.
     pub async fn register<T: Task>(&self) -> Result<()> {
         let mut reg = self.registry.lock().await;

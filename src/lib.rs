@@ -1,7 +1,7 @@
 //! Capivara — Rust-idiomatic job / worker library.
 //!
-//! **Status:** early development; APIs may change before a formal `0.1.0` release
-//! announcement. Suitable for experimentation and learning.
+//! **Status:** early development (`0.0.x`, `publish = false`). APIs may change
+//! before a formal crates.io release. Suitable for experimentation and learning.
 //!
 //! # Topology (Celery-like system shape)
 //!

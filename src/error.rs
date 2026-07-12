@@ -23,7 +23,8 @@ pub enum CapivaraError {
     #[error("job `{id}` not found in broker")]
     JobNotFound { id: String },
 
-    #[error("failed to serialize payload: {0}")]
+    /// JSON encode/decode failure (name kept short; covers both directions).
+    #[error("JSON serde error: {0}")]
     Serialize(#[from] serde_json::Error),
 
     #[error("task failed: {message}")]

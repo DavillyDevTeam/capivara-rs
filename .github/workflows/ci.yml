@@ -6,6 +6,15 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: jobs only need to read the repo (no write to contents/packages).
+permissions:
+  contents: read
+
+# One active run per workflow+ref; cancel superseded pushes on the same PR/branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
