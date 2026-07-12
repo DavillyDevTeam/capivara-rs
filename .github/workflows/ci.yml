@@ -6,9 +6,10 @@ on:
   pull_request:
     branches: [main]
 
-# Least privilege: jobs only need to read the repo (no write to contents/packages).
+# Least privilege: contents read for checkout; actions write so rust-cache can save.
 permissions:
   contents: read
+  actions: write
 
 # One active run per workflow+ref; cancel superseded pushes on the same PR/branch.
 concurrency:

@@ -157,18 +157,17 @@ async fn bad_json_payload_stores_failure() {
 
     match app.get_result(id).await.unwrap() {
         JobResult::Failure { message } => {
-            // serde_json error text is implementation-defined; require a clear failure.
+            // CapivaraError::Serialize Display prefix is stable; not raw serde_json text.
             assert!(
-                message.to_lowercase().contains("serde")
-                    || message.to_lowercase().contains("json")
-                    || message.to_lowercase().contains("expected")
-                    || message.contains("EOF")
-                    || message.contains("key must be"),
+                message.contains("JSON serde error"),
                 "unexpected message: {message}"
             );
         }
         JobResult::Success { .. } => panic!("expected deserialize failure"),
     }
+
+    // Job must be acked (not stuck in-flight).
+    assert!(app.broker().claim().await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -176,17 +175,36 @@ async fn max_jobs_limits_processing() {
     let app = App::new(MemoryBroker::new()).with_result_backend(MemoryResultBackend::new());
     app.register::<Add>().await.unwrap();
 
-    let _a = app.send::<Add>(&AddArgs { x: 1, y: 1 }).await.unwrap();
-    let _b = app.send::<Add>(&AddArgs { x: 2, y: 2 }).await.unwrap();
-    let _c = app.send::<Add>(&AddArgs { x: 3, y: 3 }).await.unwrap();
+    let a = app.send::<Add>(&AddArgs { x: 1, y: 1 }).await.unwrap();
+    let b = app.send::<Add>(&AddArgs { x: 2, y: 2 }).await.unwrap();
+    let c = app.send::<Add>(&AddArgs { x: 3, y: 3 }).await.unwrap();
 
     let n = app.run_worker(Some(2)).await.unwrap();
     assert_eq!(n, 2, "worker should stop after max_jobs");
 
-    // One job still pending on the shared broker.
+    // First two processed successfully; third never ran.
+    match app.get_result(a).await.unwrap() {
+        JobResult::Success { .. } => {}
+        JobResult::Failure { message } => panic!("first job failed: {message}"),
+    }
+    match app.get_result(b).await.unwrap() {
+        JobResult::Success { .. } => {}
+        JobResult::Failure { message } => panic!("second job failed: {message}"),
+    }
+    let err = app.get_result(c).await.unwrap_err();
+    assert!(
+        matches!(err, CapivaraError::ResultNotFound { .. }),
+        "third job should not have a result: {err:?}"
+    );
+
+    // One job still pending on the shared broker — must be the third.
     let leftover = app.broker().claim().await.unwrap();
-    assert!(leftover.is_some(), "third job should still be claimable");
-    app.broker().ack(&leftover.unwrap().id).await.unwrap();
+    let leftover = leftover.expect("third job should still be claimable");
+    assert_eq!(
+        leftover.id, c,
+        "leftover job should be the unprocessed third"
+    );
+    app.broker().ack(&leftover.id).await.unwrap();
 }
 
 #[tokio::test]
@@ -246,6 +264,18 @@ async fn unknown_task_name_on_claimed_job_is_failed_and_acked() {
     }
 
     // Not stuck in-flight.
+    assert!(app.broker().claim().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn unknown_task_name_without_backend_still_acks() {
+    // Registry miss with no result backend must still claim+ack (fire-and-forget drain).
+    let app = App::new(MemoryBroker::new());
+    // no result backend
+    let job = Job::new("ghost", b"{}".to_vec());
+    app.broker().enqueue(job).await.unwrap();
+    let n = app.run_worker(None).await.unwrap();
+    assert_eq!(n, 1);
     assert!(app.broker().claim().await.unwrap().is_none());
 }
 

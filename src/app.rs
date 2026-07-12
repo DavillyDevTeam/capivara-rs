@@ -45,7 +45,9 @@ impl App {
     /// Shared broker handle (same instance the app uses for `send` / worker).
     ///
     /// Useful for tests and advanced injection (e.g. enqueue a raw [`Job`] that
-    /// bypasses typed [`Self::send`]).
+    /// bypasses typed [`Self::send`]). Future broker-side validation on the
+    /// Redis/send path (if any) will not apply to raw [`Broker::enqueue`] via
+    /// this escape hatch.
     pub fn broker(&self) -> Arc<dyn Broker> {
         Arc::clone(&self.broker)
     }
