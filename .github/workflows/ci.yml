@@ -6,12 +6,10 @@ on:
   pull_request:
     branches: [main]
 
-# Least privilege: contents read for checkout; actions write so rust-cache can save.
 permissions:
   contents: read
   actions: write
 
-# One active run per workflow+ref; cancel superseded pushes on the same PR/branch.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -25,7 +23,7 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -36,20 +34,24 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: cargo clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo clippy (redis feature)
+        run: cargo clippy --all-targets --features redis -- -D warnings
 
   test:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test
+      - name: cargo test (default features)
         run: cargo test --all-targets
+      - name: cargo test (redis feature)
+        run: cargo test --all-targets --features redis

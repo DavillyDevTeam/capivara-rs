@@ -96,6 +96,7 @@ impl App {
             registry,
             broker: Arc::clone(&self.broker),
             results: self.results.clone(),
+            queues: vec![self.default_queue.clone()],
         };
         worker.run(max_jobs).await
     }

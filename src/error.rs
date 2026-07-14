@@ -27,6 +27,9 @@ pub enum CapivaraError {
     #[error("JSON serde error: {0}")]
     Serialize(#[from] serde_json::Error),
 
+    #[error("broker error: {0}")]
+    Broker(String),
+
     #[error("task failed: {message}")]
     TaskFailed { message: String },
 

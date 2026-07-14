@@ -29,10 +29,30 @@ a universal CLI that runs arbitrary remote code.
 - CI: fmt, clippy, tests (least-privilege permissions + concurrency)
 - Dependabot for Cargo / Actions; secret scanning enabled on the repo
 
+## Features
+
+| Feature | Default | What it enables |
+|---|---|---|
+| *(none)* | yes | `MemoryBroker` / `MemoryResultBackend` |
+| `redis` | **opt-in** | `RedisBroker` (LIST + lease; multi-process capable) |
+
+```toml
+capivara = { version = "0.0.1", features = ["redis"] }
+```
+
+Redis integration tests (`cargo test --features redis`) use **testcontainers** when
+`REDIS_URL` is unset. For local runs without a working testcontainers Docker socket:
+
+```bash
+docker run -d --rm -p 6379:6379 docker.io/library/redis:7-alpine
+REDIS_URL=redis://127.0.0.1:6379/ cargo test --features redis
+```
+
 ## Not yet
 
-- Redis / multi-process workers  
-- Retries, DLQ, leases / recoverer  
+- Lease **recoverer** loop & full delayed-retry worker policy (M1 PR-B)  
+- `RedisResultBackend` & worker concurrency N (M1 PR-C)  
+- DLQ / exponential backoff (M2)  
 - Proc-macro or `app.task("name", fn)` sugar  
 - crates.io publish (`publish = false` until then)
 
