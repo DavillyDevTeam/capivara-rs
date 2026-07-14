@@ -3,7 +3,8 @@
 //! These prove the Celery-like *topology* without Redis.
 
 use capivara::{
-    App, CapivaraError, Job, JobId, JobResult, MemoryBroker, MemoryResultBackend, Task, TaskError,
+    App, CapivaraError, Job, JobId, JobResult, MemoryBroker, MemoryResultBackend, QueueName, Task,
+    TaskError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -167,7 +168,17 @@ async fn bad_json_payload_stores_failure() {
     }
 
     // Job must be acked (not stuck in-flight).
-    assert!(app.broker().claim().await.unwrap().is_none());
+    assert!(
+        app.broker()
+            .claim(
+                &[],
+                std::time::Duration::from_secs(30),
+                std::time::Duration::ZERO
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -198,13 +209,21 @@ async fn max_jobs_limits_processing() {
     );
 
     // One job still pending on the shared broker — must be the third.
-    let leftover = app.broker().claim().await.unwrap();
+    let leftover = app
+        .broker()
+        .claim(
+            &[],
+            std::time::Duration::from_secs(30),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
     let leftover = leftover.expect("third job should still be claimable");
     assert_eq!(
-        leftover.id, c,
+        leftover.job.id, c,
         "leftover job should be the unprocessed third"
     );
-    app.broker().ack(&leftover.id).await.unwrap();
+    app.broker().ack(&leftover.job.id).await.unwrap();
 }
 
 #[tokio::test]
@@ -233,7 +252,17 @@ async fn fire_and_forget_worker_acks_without_stuck_job() {
     assert_eq!(n, 1);
 
     // Queue empty / nothing in-flight to claim.
-    assert!(app.broker().claim().await.unwrap().is_none());
+    assert!(
+        app.broker()
+            .claim(
+                &[],
+                std::time::Duration::from_secs(30),
+                std::time::Duration::ZERO
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Results API correctly refuses without a backend.
     let err = app.get_result(id).await.unwrap_err();
@@ -264,7 +293,17 @@ async fn unknown_task_name_on_claimed_job_is_failed_and_acked() {
     }
 
     // Not stuck in-flight.
-    assert!(app.broker().claim().await.unwrap().is_none());
+    assert!(
+        app.broker()
+            .claim(
+                &[],
+                std::time::Duration::from_secs(30),
+                std::time::Duration::ZERO
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -276,7 +315,17 @@ async fn unknown_task_name_without_backend_still_acks() {
     app.broker().enqueue(job).await.unwrap();
     let n = app.run_worker(None).await.unwrap();
     assert_eq!(n, 1);
-    assert!(app.broker().claim().await.unwrap().is_none());
+    assert!(
+        app.broker()
+            .claim(
+                &[],
+                std::time::Duration::from_secs(30),
+                std::time::Duration::ZERO
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -285,8 +334,17 @@ async fn with_default_queue_is_applied_on_send() {
     app.register::<Add>().await.unwrap();
 
     let id = app.send::<Add>(&AddArgs { x: 0, y: 0 }).await.unwrap();
-    let job = app.broker().claim().await.unwrap().expect("job enqueued");
-    assert_eq!(job.id, id);
-    assert_eq!(job.queue.as_str(), "emails");
-    app.broker().ack(&job.id).await.unwrap();
+    let job = app
+        .broker()
+        .claim(
+            &[QueueName::new("emails")],
+            std::time::Duration::from_secs(30),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap()
+        .expect("job enqueued");
+    assert_eq!(job.job.id, id);
+    assert_eq!(job.job.queue.as_str(), "emails");
+    app.broker().ack(&job.job.id).await.unwrap();
 }

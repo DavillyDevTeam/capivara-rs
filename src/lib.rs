@@ -9,6 +9,11 @@
 //! register Task types → send::<T>(&args) → Broker → Worker → optional ResultBackend
 //! ```
 //!
+//! # Features
+//!
+//! - *(default)* Memory broker/results for in-process tests.
+//! - `redis` — [`RedisBroker`] multi-process Redis LIST + lease broker.
+//!
 //! # Example
 //!
 //! ```
@@ -52,12 +57,6 @@
 //! # Ok(())
 //! # }
 //! ```
-//!
-//! # Design notes
-//!
-//! - **Typed tasks** (`impl Task`) — not stringly `app.task("name", fn)`.
-//! - **Optional results** — `get_result` errors if no backend is configured.
-//! - **Memory backends** are for tests / single-process demos; Redis comes later.
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
@@ -72,7 +71,9 @@ mod task;
 mod worker;
 
 pub use app::App;
-pub use broker::{Broker, MemoryBroker};
+pub use broker::{Broker, ClaimedJob, MemoryBroker, NackAction};
+#[cfg(feature = "redis")]
+pub use broker::{RedisBroker, RedisConfig};
 pub use error::{CapivaraError, Result, TaskError};
 pub use job::{Job, JobId, QueueName};
 pub use result::{JobResult, MemoryResultBackend, ResultBackend};
