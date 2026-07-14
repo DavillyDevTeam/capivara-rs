@@ -28,8 +28,8 @@ pub struct ClaimedJob {
 pub enum NackAction {
     /// Put the job aside until `delay` elapses, then make it claimable again.
     ///
-    /// Redis uses a delayed ZSET; Memory requeues immediately in PR-A
-    /// (full delayed memory behavior can match Redis later).
+    /// Both Redis and Memory honor `delay` (Memory uses an in-process delayed
+    /// list; Redis uses a delayed ZSET promoted on claim).
     RequeueAfter { delay: Duration },
 }
 
@@ -55,7 +55,11 @@ pub trait Broker: Send + Sync {
         block_for: Duration,
     ) -> Result<Option<ClaimedJob>>;
 
-    /// Acknowledge successful processing (remove from in-flight / lease).
+    /// Complete this claim attempt: drop the lease / in-flight entry.
+    ///
+    /// Does **not** imply the task handler succeeded — the worker may `ack`
+    /// after storing a failure result (PR-A always-acks; PR-B may nack-retry
+    /// instead). Call only when this worker currently holds the claim.
     async fn ack(&self, id: &JobId) -> Result<()>;
 
     /// Negative-ack: requeue according to `action` (no DLQ in M1).

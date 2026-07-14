@@ -9,12 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Optional Cargo feature `redis` with `RedisBroker` (LIST + lease, Lua claim, blocking poll).
+- Optional Cargo feature `redis` with `RedisBroker` (LIST + lease, Lua claim/ack/nack, delayed requeue).
 - Extended `Broker` trait: `claim(queues, lease, block_for)`, `nack(RequeueAfter)`; `ClaimedJob`.
-- testcontainers Redis integration tests (`tests/redis_broker.rs`).
-
-### Added
-
+- testcontainers Redis integration tests (`tests/redis_broker.rs`), with `REDIS_URL` override.
 - Typed `Task` trait with native async `run`, `App::register` / `send` / `run_worker` / `get_result`.
 - `MemoryBroker` and optional `MemoryResultBackend` (in-process; success and failure stored).
 - Worker panic isolation via `tokio::spawn` join errors.

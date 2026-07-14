@@ -9,8 +9,8 @@
 //! - `{prefix}lease` — ZSET score = lease expiry (unix ms), member = job id
 //! - `{prefix}delayed` — ZSET score = available_at (unix ms), member = job id
 //!
-//! Claim is a **Lua** script so RPOP + lease update is atomic.
-//! Blocking claim polls Lua until `block_for` elapses (safe; no BRPOP race).
+//! Claim / promote / ack paths use **Lua** so multi-worker races cannot
+//! double-enqueue or delete unowned job bodies.
 
 use crate::broker::{Broker, ClaimedJob, NackAction};
 use crate::error::{CapivaraError, Result};
@@ -48,6 +48,9 @@ pub struct RedisBroker {
     claim_script: Script,
     ack_script: Script,
     nack_script: Script,
+    /// Atomically: for each due delayed id, ZREM then LPUSH only if we won ZREM.
+    /// KEYS[1]=delayed, ARGV[1]=now_ms, ARGV[2]=job key prefix (capivara:job:)
+    /// Returns number of jobs promoted.
     promote_script: Script,
 }
 
@@ -62,7 +65,6 @@ impl RedisBroker {
 
         // KEYS[1] = pending list, KEYS[2] = lease zset
         // ARGV[1] = job key prefix (e.g. capivara:job:), ARGV[2] = lease expiry ms
-        // Returns job JSON or nil
         let claim_script = Script::new(
             r#"
             local id = redis.call('RPOP', KEYS[1])
@@ -79,21 +81,29 @@ impl RedisBroker {
             "#,
         );
 
+        // Only delete the job body if we actually held the lease.
         // KEYS[1] = lease zset, ARGV[1] = job key, ARGV[2] = id
         let ack_script = Script::new(
             r#"
             local removed = redis.call('ZREM', KEYS[1], ARGV[2])
-            redis.call('DEL', ARGV[1])
+            if removed == 1 then
+              redis.call('DEL', ARGV[1])
+            end
             return removed
             "#,
         );
 
         // KEYS[1]=lease, KEYS[2]=pending or delayed
         // ARGV[1]=job key, ARGV[2]=id, ARGV[3]=mode ('pending'|'delayed'), ARGV[4]=score if delayed
+        // ARGV[1]=job key, ARGV[2]=id (lease member), ARGV[3]=mode,
+        // ARGV[4]=score if delayed, ARGV[5]=delayed member ("queue\x1fid") if delayed
         let nack_script = Script::new(
             r#"
             local id = ARGV[2]
-            redis.call('ZREM', KEYS[1], id)
+            local removed = redis.call('ZREM', KEYS[1], id)
+            if removed == 0 then
+              return 0
+            end
             local body = redis.call('GET', ARGV[1])
             if not body then
               return 0
@@ -101,21 +111,36 @@ impl RedisBroker {
             if ARGV[3] == 'pending' then
               redis.call('LPUSH', KEYS[2], id)
             else
-              redis.call('ZADD', KEYS[2], ARGV[4], id)
+              redis.call('ZADD', KEYS[2], ARGV[4], ARGV[5])
             end
             return 1
             "#,
         );
 
-        // KEYS[1]=delayed zset, KEYS[2]=pending list, ARGV[1]=now_ms
+        // KEYS[1]=delayed zset
+        // ARGV[1]=now_ms, ARGV[2]=job key prefix
+        // For each due id: ZREM (win) → GET body → LPUSH to that job's pending queue.
+        // Only the worker that wins ZREM may LPUSH (no double-enqueue).
+        // Delayed ZSET member format: "{queue}\x1f{job_id}" so we never need cjson.
+        // KEYS[1]=delayed, ARGV[1]=now_ms, ARGV[2]=pending key prefix ("{prefix}q:")
         let promote_script = Script::new(
             r#"
-            local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
-            for _, id in ipairs(ids) do
-              redis.call('ZREM', KEYS[1], id)
-              redis.call('LPUSH', KEYS[2], id)
+            local members = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+            local promoted = 0
+            local sep = string.char(0x1f)
+            for _, member in ipairs(members) do
+              if redis.call('ZREM', KEYS[1], member) == 1 then
+                local pos = string.find(member, sep, 1, true)
+                if pos then
+                  local q = string.sub(member, 1, pos - 1)
+                  local id = string.sub(member, pos + 1)
+                  local pending = ARGV[2] .. q .. ':pending'
+                  redis.call('LPUSH', pending, id)
+                  promoted = promoted + 1
+                end
+              end
             end
-            return #ids
+            return promoted
             "#,
         );
 
@@ -131,6 +156,11 @@ impl RedisBroker {
 
     fn pending_key(&self, queue: &str) -> String {
         format!("{}q:{}:pending", self.prefix, queue)
+    }
+
+    fn pending_key_prefix(&self) -> String {
+        // "{prefix}q:" so script can build "{prefix}q:{queue}:pending"
+        format!("{}q:", self.prefix)
     }
 
     fn job_key(&self, id: &JobId) -> String {
@@ -156,68 +186,18 @@ impl RedisBroker {
             .unwrap_or(0)
     }
 
-    async fn promote_delayed(&self, queues: &[QueueName]) -> Result<()> {
+    /// Promote due delayed jobs. Queue filter is applied after promote by claim
+    /// (jobs land on their own queue's pending list).
+    async fn promote_delayed(&self) -> Result<()> {
         let mut conn = self.conn.clone();
-        let now = Self::now_ms().to_string();
-        let queue_names: Vec<String> = if queues.is_empty() {
-            vec![QueueName::default().as_str().to_string()]
-        } else {
-            queues.iter().map(|q| q.as_str().to_string()).collect()
-        };
-        // Promote into each queue's pending — delayed members are job ids; job has queue field.
-        // For M1 simplicity: delayed jobs are always pushed to the first requested queue's pending,
-        // or we store "queue\0id" — better: on nack we know queue from job body.
-        // Delayed ZSET member = job id only; on promote LPUSH to job's queue from GET body.
-        // So promote script needs to be smarter — promote in Rust for PR-A clarity:
-
-        let delayed_key = self.delayed_key();
-        let ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
-            .arg(&delayed_key)
-            .arg("-inf")
-            .arg(&now)
-            .query_async(&mut conn)
+        let _: i32 = self
+            .promote_script
+            .key(self.delayed_key())
+            .arg(Self::now_ms())
+            .arg(self.pending_key_prefix())
+            .invoke_async(&mut conn)
             .await
             .map_err(|e| CapivaraError::Broker(e.to_string()))?;
-
-        for id in ids {
-            let job_key = format!("{}job:{}", self.prefix, id);
-            let body: Option<String> = redis::cmd("GET")
-                .arg(&job_key)
-                .query_async(&mut conn)
-                .await
-                .map_err(|e| CapivaraError::Broker(e.to_string()))?;
-            let Some(body) = body else {
-                let _: i32 = redis::cmd("ZREM")
-                    .arg(&delayed_key)
-                    .arg(&id)
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(|e| CapivaraError::Broker(e.to_string()))?;
-                continue;
-            };
-            let job: Job = serde_json::from_str(&body)?;
-            let pending = self.pending_key(job.queue.as_str());
-            // Only promote if that queue is in the claim filter (or filter empty/default).
-            let allowed = queue_names.iter().any(|q| q == job.queue.as_str());
-            if !allowed {
-                continue;
-            }
-            let _: i32 = redis::cmd("ZREM")
-                .arg(&delayed_key)
-                .arg(&id)
-                .query_async(&mut conn)
-                .await
-                .map_err(|e| CapivaraError::Broker(e.to_string()))?;
-            let _: i32 = redis::cmd("LPUSH")
-                .arg(&pending)
-                .arg(&id)
-                .query_async(&mut conn)
-                .await
-                .map_err(|e| CapivaraError::Broker(e.to_string()))?;
-        }
-
-        // silence unused script for now (used as documentation / future)
-        let _ = &self.promote_script;
         Ok(())
     }
 
@@ -265,8 +245,10 @@ impl Broker for RedisBroker {
         let pending = self.pending_key(job.queue.as_str());
         let body = serde_json::to_string(&job)?;
 
-        // SET job + LPUSH pending (pipeline)
+        // Atomic SET + LPUSH so a crash cannot leave a list entry without a body
+        // (or orphan body only — SET-first still preferred).
         redis::pipe()
+            .atomic()
             .cmd("SET")
             .arg(&job_key)
             .arg(&body)
@@ -294,7 +276,7 @@ impl Broker for RedisBroker {
 
         let deadline = Instant::now() + block_for;
         loop {
-            self.promote_delayed(queues).await?;
+            self.promote_delayed().await?;
 
             for q in &queue_names {
                 if let Some(claimed) = self.try_claim_one(q, lease).await? {
@@ -329,7 +311,6 @@ impl Broker for RedisBroker {
 
     async fn nack(&self, id: &JobId, action: NackAction) -> Result<()> {
         let mut conn = self.conn.clone();
-        // Need job body for queue name
         let job_key = self.job_key(id);
         let body: Option<String> = redis::cmd("GET")
             .arg(&job_key)
@@ -353,6 +334,7 @@ impl Broker for RedisBroker {
                         .arg(id.to_string())
                         .arg("pending")
                         .arg(0)
+                        .arg("")
                         .invoke_async(&mut conn)
                         .await
                         .map_err(|e| CapivaraError::Broker(e.to_string()))?;
@@ -362,6 +344,8 @@ impl Broker for RedisBroker {
                 } else {
                     let score = Self::now_ms() + delay.as_millis() as u64;
                     let delayed = self.delayed_key();
+                    let delayed_member =
+                        format!("{}{}{}", job.queue.as_str(), char::from(0x1f), id);
                     let ok: i32 = self
                         .nack_script
                         .key(self.lease_key())
@@ -370,6 +354,7 @@ impl Broker for RedisBroker {
                         .arg(id.to_string())
                         .arg("delayed")
                         .arg(score)
+                        .arg(&delayed_member)
                         .invoke_async(&mut conn)
                         .await
                         .map_err(|e| CapivaraError::Broker(e.to_string()))?;

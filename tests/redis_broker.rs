@@ -168,3 +168,61 @@ async fn redis_nack_requeue_immediate() {
     assert_eq!(again.job.attempts, 2);
     broker.ack(&id).await.unwrap();
 }
+
+#[tokio::test]
+async fn redis_nack_delayed_then_promoted() {
+    let (_guard, url) = redis_url().await;
+    let broker = RedisBroker::connect(RedisConfig::new(url).with_prefix("capivara_delay:"))
+        .await
+        .unwrap();
+
+    let mut job = Job::new("ping", br#"{"msg":"later"}"#.to_vec());
+    job.queue = QueueName::default();
+    let id = broker.enqueue(job).await.unwrap();
+
+    let claimed = broker
+        .claim(
+            &[QueueName::default()],
+            Duration::from_secs(30),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.job.id, id);
+
+    broker
+        .nack(
+            &id,
+            NackAction::RequeueAfter {
+                delay: Duration::from_millis(250),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Not claimable immediately.
+    let none = broker
+        .claim(
+            &[QueueName::default()],
+            Duration::from_secs(30),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert!(none.is_none(), "job should still be delayed");
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    let again = broker
+        .claim(
+            &[QueueName::default()],
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .expect("promoted after delay");
+    assert_eq!(again.job.id, id);
+    broker.ack(&id).await.unwrap();
+}
