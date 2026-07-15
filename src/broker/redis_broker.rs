@@ -131,7 +131,9 @@ impl RedisBroker {
             "#,
         );
 
-        // KEYS[1]=delayed, ARGV[1]=now_ms, ARGV[2]=pending key prefix, ARGV[3]=job key prefix
+        // KEYS[1]=delayed
+        // ARGV[1]=now_ms, ARGV[2]=pending key prefix, ARGV[3]=job key prefix,
+        // ARGV[4]=attempts key prefix
         // Delayed member: "{queue}\x1f{job_id}"
         let promote_script = Script::new(
             r#"
@@ -149,6 +151,9 @@ impl RedisBroker {
                     local pending = ARGV[2] .. q .. ':pending'
                     redis.call('LPUSH', pending, id)
                     promoted = promoted + 1
+                  else
+                    -- Orphan delayed entry without body: drop attempts counter too.
+                    redis.call('DEL', ARGV[4] .. id)
                   end
                 end
               end
@@ -157,7 +162,9 @@ impl RedisBroker {
             "#,
         );
 
-        // KEYS[1]=lease, ARGV[1]=now_ms, ARGV[2]=pending key prefix, ARGV[3]=job key prefix
+        // KEYS[1]=lease
+        // ARGV[1]=now_ms, ARGV[2]=pending key prefix, ARGV[3]=job key prefix,
+        // ARGV[4]=attempts key prefix
         // Lease member: "{queue}\x1f{id}\x1f{token}" — parse queue+id, ignore token.
         // Only LPUSH when job body still exists (mirrors nack).
         let recover_script = Script::new(
@@ -182,6 +189,9 @@ impl RedisBroker {
                     local pending = ARGV[2] .. q .. ':pending'
                     redis.call('LPUSH', pending, id)
                     recovered = recovered + 1
+                  else
+                    -- Orphan lease without body: drop attempts counter too.
+                    redis.call('DEL', ARGV[4] .. id)
                   end
                 end
               end
@@ -259,6 +269,7 @@ impl RedisBroker {
             .arg(Self::now_ms())
             .arg(self.pending_key_prefix())
             .arg(self.job_key_prefix())
+            .arg(self.attempts_key_prefix())
             .invoke_async(&mut conn)
             .await
             .map_err(|e| CapivaraError::Broker(e.to_string()))?;
@@ -274,6 +285,7 @@ impl RedisBroker {
             .arg(Self::now_ms())
             .arg(self.pending_key_prefix())
             .arg(self.job_key_prefix())
+            .arg(self.attempts_key_prefix())
             .invoke_async(&mut conn)
             .await
             .map_err(|e| CapivaraError::Broker(e.to_string()))?;

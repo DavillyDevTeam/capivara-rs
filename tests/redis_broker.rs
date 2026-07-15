@@ -4,8 +4,8 @@
 //! testcontainers (needs a working Docker socket — standard on GHA).
 
 use capivara::{
-    App, Broker, Job, JobResult, MemoryResultBackend, NackAction, QueueName, RedisBroker,
-    RedisConfig, Task, TaskError,
+    App, Broker, CapivaraError, Job, JobResult, MemoryResultBackend, NackAction, QueueName,
+    RedisBroker, RedisConfig, Task, TaskError,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -260,6 +260,60 @@ async fn redis_lease_expires_then_reclaimed() {
     assert_eq!(again.job.id, id);
     assert_eq!(again.job.attempts, 2);
     broker.ack(&id, &again.claim_token).await.unwrap();
+}
+
+#[tokio::test]
+async fn redis_late_ack_after_recover_does_not_steal_new_claim() {
+    let (_guard, url) = redis_url().await;
+    let broker = RedisBroker::connect(RedisConfig::new(url).with_prefix("capivara_late_ack:"))
+        .await
+        .unwrap();
+
+    let mut job = Job::new("ping", br#"{"msg":"steal"}"#.to_vec());
+    job.queue = QueueName::default();
+    let id = broker.enqueue(job).await.unwrap();
+
+    let short_lease = Duration::from_millis(200);
+    let claim_a = broker
+        .claim(&[QueueName::default()], short_lease, Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("claim A");
+    assert_eq!(claim_a.job.id, id);
+    assert_eq!(claim_a.job.attempts, 1);
+    let token_a = claim_a.claim_token;
+
+    // Expire lease; recover-on-claim requeues; B claims with a new token.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let claim_b = broker
+        .claim(
+            &[QueueName::default()],
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .expect("claim B after recover");
+    assert_eq!(claim_b.job.id, id);
+    assert_eq!(claim_b.job.attempts, 2);
+    assert_ne!(token_a, claim_b.claim_token);
+
+    // Late ack from A must fail and must not destroy B's claim.
+    let err = broker.ack(&id, &token_a).await.unwrap_err();
+    assert!(matches!(err, CapivaraError::JobNotFound { .. }));
+
+    // B still owns the claim and can settle.
+    broker.ack(&id, &claim_b.claim_token).await.unwrap();
+
+    let none = broker
+        .claim(
+            &[QueueName::default()],
+            Duration::from_secs(30),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert!(none.is_none());
 }
 
 struct AlwaysFails;
