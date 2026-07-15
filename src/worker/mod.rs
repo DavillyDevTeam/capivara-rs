@@ -71,33 +71,12 @@ impl Worker {
 
         let mut processed = 0usize;
         let mut in_flight: JoinSet<Result<()>> = JoinSet::new();
-        let mut stop_claiming = false;
         let mut first_err: Option<CapivaraError> = None;
 
         loop {
             // Reap completed work without blocking when we can still claim.
-            while let Some(joined) = poll_join_next(&mut in_flight) {
-                match joined {
-                    Ok(Ok(())) => processed += 1,
-                    Ok(Err(e)) => {
-                        processed += 1;
-                        if first_err.is_none() {
-                            first_err = Some(e);
-                        }
-                        stop_claiming = true;
-                    }
-                    Err(join_err) => {
-                        // Outer task panicked (should be rare — handler panics
-                        // are isolated inside process_one).
-                        processed += 1;
-                        if first_err.is_none() {
-                            first_err = Some(CapivaraError::TaskPanicked {
-                                message: join_err.to_string(),
-                            });
-                        }
-                        stop_claiming = true;
-                    }
-                }
+            while let Some(joined) = in_flight.try_join_next() {
+                account_join(joined, &mut processed, &mut first_err);
             }
 
             if first_err.is_some() {
@@ -111,31 +90,13 @@ impl Worker {
             let slots_used = in_flight.len();
             let under_max = max_jobs.is_none_or(|m| processed + slots_used < m);
 
-            if stop_claiming || !under_max {
+            if !under_max {
                 if in_flight.is_empty() {
                     break;
                 }
                 // Wait for one in-flight job so we can re-check limits.
                 if let Some(joined) = in_flight.join_next().await {
-                    match joined {
-                        Ok(Ok(())) => processed += 1,
-                        Ok(Err(e)) => {
-                            processed += 1;
-                            if first_err.is_none() {
-                                first_err = Some(e);
-                            }
-                            stop_claiming = true;
-                        }
-                        Err(join_err) => {
-                            processed += 1;
-                            if first_err.is_none() {
-                                first_err = Some(CapivaraError::TaskPanicked {
-                                    message: join_err.to_string(),
-                                });
-                            }
-                            stop_claiming = true;
-                        }
-                    }
+                    account_join(joined, &mut processed, &mut first_err);
                 }
                 continue;
             }
@@ -145,26 +106,17 @@ impl Worker {
                 Ok(p) => p,
                 Err(_) => {
                     // At concurrency limit — wait for one job to finish.
+                    // Empty JoinSet + exhausted semaphore is an invariant break
+                    // (would busy-loop otherwise).
+                    if in_flight.is_empty() {
+                        first_err = Some(CapivaraError::Internal {
+                            message: "semaphore exhausted with no in-flight jobs (permit leak)"
+                                .into(),
+                        });
+                        break;
+                    }
                     if let Some(joined) = in_flight.join_next().await {
-                        match joined {
-                            Ok(Ok(())) => processed += 1,
-                            Ok(Err(e)) => {
-                                processed += 1;
-                                if first_err.is_none() {
-                                    first_err = Some(e);
-                                }
-                                stop_claiming = true;
-                            }
-                            Err(join_err) => {
-                                processed += 1;
-                                if first_err.is_none() {
-                                    first_err = Some(CapivaraError::TaskPanicked {
-                                        message: join_err.to_string(),
-                                    });
-                                }
-                                stop_claiming = true;
-                            }
-                        }
+                        account_join(joined, &mut processed, &mut first_err);
                     }
                     continue;
                 }
@@ -191,25 +143,7 @@ impl Worker {
                     }
                     // Wait for in-flight; a nack(delay=0) may requeue work.
                     if let Some(joined) = in_flight.join_next().await {
-                        match joined {
-                            Ok(Ok(())) => processed += 1,
-                            Ok(Err(e)) => {
-                                processed += 1;
-                                if first_err.is_none() {
-                                    first_err = Some(e);
-                                }
-                                stop_claiming = true;
-                            }
-                            Err(join_err) => {
-                                processed += 1;
-                                if first_err.is_none() {
-                                    first_err = Some(CapivaraError::TaskPanicked {
-                                        message: join_err.to_string(),
-                                    });
-                                }
-                                stop_claiming = true;
-                            }
-                        }
+                        account_join(joined, &mut processed, &mut first_err);
                     }
                 }
                 Err(e) => {
@@ -217,30 +151,13 @@ impl Worker {
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
-                    stop_claiming = true;
                 }
             }
         }
 
         // Drain remaining in-flight work.
         while let Some(joined) = in_flight.join_next().await {
-            match joined {
-                Ok(Ok(())) => processed += 1,
-                Ok(Err(e)) => {
-                    processed += 1;
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
-                }
-                Err(join_err) => {
-                    processed += 1;
-                    if first_err.is_none() {
-                        first_err = Some(CapivaraError::TaskPanicked {
-                            message: join_err.to_string(),
-                        });
-                    }
-                }
-            }
+            account_join(joined, &mut processed, &mut first_err);
         }
 
         if let Some(e) = first_err {
@@ -277,17 +194,31 @@ impl Worker {
     }
 }
 
-/// Non-blocking poll of the next completed join (None if none ready).
-fn poll_join_next(
-    set: &mut JoinSet<Result<()>>,
-) -> Option<std::result::Result<Result<()>, tokio::task::JoinError>> {
-    if set.is_empty() {
-        return None;
+/// Record a finished JoinSet task: always increments `processed`; stores the
+/// first infrastructure / outer-panic error for later return.
+fn account_join(
+    joined: std::result::Result<Result<()>, tokio::task::JoinError>,
+    processed: &mut usize,
+    first_err: &mut Option<CapivaraError>,
+) {
+    *processed += 1;
+    match joined {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            if first_err.is_none() {
+                *first_err = Some(e);
+            }
+        }
+        Err(join_err) => {
+            // Outer task panicked (should be rare — handler panics are isolated
+            // inside process_one).
+            if first_err.is_none() {
+                *first_err = Some(CapivaraError::TaskPanicked {
+                    message: join_err.to_string(),
+                });
+            }
+        }
     }
-    // Prefer try_join_next when available (tokio 1.40+); fall back to
-    // zero-timeout biased poll via join_next only when something might be ready.
-    // `try_join_next` is on JoinSet since tokio 1.40.
-    set.try_join_next()
 }
 
 /// Run a single claimed job: handler → store → ack/nack with this claim's token.

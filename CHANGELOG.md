@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`RedisResultBackend`** (`redis` feature): `{prefix}result:{id}` STRING JSON `JobResult`,
   default TTL **24h** (`EX 86400`); shares [`RedisConfig`] with the broker.
+- `CapivaraError::ResultBackend` for result-backend I/O (distinct from `Broker`).
 - Worker **concurrency** via Tokio `Semaphore` (default **4**); `App::with_concurrency` (clamped ≥ 1).
 - Redis integration: full roundtrip with `RedisBroker` + `RedisResultBackend`; concurrency smoke.
 - Memory concurrency smoke test (several jobs with concurrency 4).

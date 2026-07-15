@@ -5,6 +5,14 @@
 //! # Key layout (prefix from [`crate::broker::RedisConfig`])
 //!
 //! - `{prefix}result:{id}` — STRING JSON [`JobResult`], default TTL 24h
+//!
+//! # Wire shape (M1)
+//!
+//! Values are `serde_json` of [`JobResult`]. For
+//! [`JobResult::Success`], `payload: Vec<u8>` is encoded as a **JSON array of
+//! numbers** (e.g. `[123, 34, 101, ...]`), not base64. That is correct and
+//! round-trips, but is bulky for large binary outputs. Changing the encoding
+//! later would be a breaking wire change for any external Redis consumers.
 
 use crate::broker::RedisConfig;
 use crate::error::{CapivaraError, Result};
@@ -33,11 +41,16 @@ impl RedisResultBackend {
 
     /// Connect with a custom result key TTL.
     pub async fn connect_with_ttl(config: RedisConfig, ttl: Duration) -> Result<Self> {
-        let client = redis::Client::open(config.url.as_str())
-            .map_err(|e| CapivaraError::Broker(e.to_string()))?;
-        let conn = ConnectionManager::new(client)
-            .await
-            .map_err(|e| CapivaraError::Broker(e.to_string()))?;
+        let client =
+            redis::Client::open(config.url.as_str()).map_err(|e| CapivaraError::ResultBackend {
+                message: e.to_string(),
+            })?;
+        let conn =
+            ConnectionManager::new(client)
+                .await
+                .map_err(|e| CapivaraError::ResultBackend {
+                    message: e.to_string(),
+                })?;
         Ok(Self {
             conn,
             prefix: config.prefix,
@@ -49,7 +62,8 @@ impl RedisResultBackend {
         })
     }
 
-    fn result_key(&self, id: &JobId) -> String {
+    /// Full Redis key for a job result (`{prefix}result:{id}`).
+    pub fn result_key(&self, id: &JobId) -> String {
         format!("{}result:{}", self.prefix, id)
     }
 }
@@ -68,7 +82,9 @@ impl ResultBackend for RedisResultBackend {
             .arg(ttl_secs)
             .query_async::<()>(&mut conn)
             .await
-            .map_err(|e| CapivaraError::Broker(e.to_string()))?;
+            .map_err(|e| CapivaraError::ResultBackend {
+                message: e.to_string(),
+            })?;
         Ok(())
     }
 
@@ -79,7 +95,9 @@ impl ResultBackend for RedisResultBackend {
             .arg(&key)
             .query_async(&mut conn)
             .await
-            .map_err(|e| CapivaraError::Broker(e.to_string()))?;
+            .map_err(|e| CapivaraError::ResultBackend {
+                message: e.to_string(),
+            })?;
         match body {
             None => Ok(None),
             Some(s) => Ok(Some(serde_json::from_str(&s)?)),
