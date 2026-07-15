@@ -83,7 +83,7 @@ async fn redis_enqueue_claim_ack() {
     assert_eq!(claimed.job.task_name, "ping");
     assert_eq!(claimed.job.attempts, 1);
 
-    broker.ack(&id).await.unwrap();
+    broker.ack(&id, &claimed.claim_token).await.unwrap();
 
     let none = broker
         .claim(
@@ -148,6 +148,7 @@ async fn redis_nack_requeue_immediate() {
     broker
         .nack(
             &id,
+            &claimed.claim_token,
             NackAction::RequeueAfter {
                 delay: Duration::ZERO,
             },
@@ -166,7 +167,7 @@ async fn redis_nack_requeue_immediate() {
         .expect("requeued");
     assert_eq!(again.job.id, id);
     assert_eq!(again.job.attempts, 2);
-    broker.ack(&id).await.unwrap();
+    broker.ack(&id, &again.claim_token).await.unwrap();
 }
 
 #[tokio::test]
@@ -194,6 +195,7 @@ async fn redis_nack_delayed_then_promoted() {
     broker
         .nack(
             &id,
+            &claimed.claim_token,
             NackAction::RequeueAfter {
                 delay: Duration::from_millis(250),
             },
@@ -224,7 +226,7 @@ async fn redis_nack_delayed_then_promoted() {
         .unwrap()
         .expect("promoted after delay");
     assert_eq!(again.job.id, id);
-    broker.ack(&id).await.unwrap();
+    broker.ack(&id, &again.claim_token).await.unwrap();
 }
 
 #[tokio::test]
@@ -257,7 +259,7 @@ async fn redis_lease_expires_then_reclaimed() {
         .expect("reclaimed after lease expiry");
     assert_eq!(again.job.id, id);
     assert_eq!(again.job.attempts, 2);
-    broker.ack(&id).await.unwrap();
+    broker.ack(&id, &again.claim_token).await.unwrap();
 }
 
 struct AlwaysFails;
@@ -292,13 +294,15 @@ async fn redis_worker_retries_then_terminal() {
         .await
         .unwrap();
 
+    let nack_delay = Duration::from_millis(80);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut total = 0usize;
-    for _ in 0..15 {
+    while total < 3 && std::time::Instant::now() < deadline {
         total += app.run_worker(None).await.unwrap();
         if total >= 3 {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        tokio::time::sleep(nack_delay + Duration::from_millis(50)).await;
     }
     assert_eq!(total, 3, "three attempts then terminal");
 

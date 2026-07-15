@@ -26,10 +26,12 @@ a universal CLI that runs arbitrary remote code.
 - **`MemoryBroker`** + optional **`MemoryResultBackend`**
   - **Single-process only** — not shared across OS processes; not a distributed queue
 - Optional **`RedisBroker`** (`redis` feature): LIST + lease, Lua claim/ack/nack,
-  delayed requeue, **lease recover-on-claim**
+  delayed requeue, **lease recover-on-claim**, **claim tokens** (late ack/nack
+  cannot steal a newer claim after recover)
 - Worker retry policy: task `Err` / panic → store Failure →
   `nack(RequeueAfter)` until `max_attempts`, then terminal `ack`
-  (unknown task name is always terminal)
+  (unknown task name is always terminal; lost-lease settle is non-fatal)
+- Claim-scoped ownership: each claim issues a `ClaimToken` required by `ack`/`nack`
 - Panic isolation at the task boundary (worker keeps going)
 - Results: `send` → `JobId`; `get_result` only if a backend is configured
   (stores **success and failure**); errors clearly if no backend / missing id

@@ -71,7 +71,7 @@ mod task;
 mod worker;
 
 pub use app::App;
-pub use broker::{Broker, ClaimedJob, MemoryBroker, NackAction};
+pub use broker::{Broker, ClaimToken, ClaimedJob, MemoryBroker, NackAction};
 #[cfg(feature = "redis")]
 pub use broker::{RedisBroker, RedisConfig};
 pub use error::{CapivaraError, Result, TaskError};

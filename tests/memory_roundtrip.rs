@@ -232,7 +232,10 @@ async fn max_jobs_limits_processing() {
         leftover.job.id, c,
         "leftover job should be the unprocessed third"
     );
-    app.broker().ack(&leftover.job.id).await.unwrap();
+    app.broker()
+        .ack(&leftover.job.id, &leftover.claim_token)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -355,7 +358,10 @@ async fn with_default_queue_is_applied_on_send() {
         .expect("job enqueued");
     assert_eq!(job.job.id, id);
     assert_eq!(job.job.queue.as_str(), "emails");
-    app.broker().ack(&job.job.id).await.unwrap();
+    app.broker()
+        .ack(&job.job.id, &job.claim_token)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -392,31 +398,34 @@ async fn lease_expires_then_reclaimed() {
         .expect("reclaimed after lease expiry");
     assert_eq!(again.job.id, id);
     assert_eq!(again.job.attempts, 2);
-    broker.ack(&id).await.unwrap();
+    broker.ack(&id, &again.claim_token).await.unwrap();
 }
 
 #[tokio::test]
 async fn worker_retries_failure_then_terminal_ack() {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
+    let nack_delay = Duration::from_millis(50);
     let app = App::new(MemoryBroker::new())
         .with_result_backend(MemoryResultBackend::new())
         .with_max_attempts(3)
-        .with_nack_delay(Duration::from_millis(50));
+        .with_nack_delay(nack_delay);
     app.register::<Fails>().await.unwrap();
 
     let id = app.send::<Fails>(&Empty).await.unwrap();
 
-    // Drain passes: each failure nacks with delay until attempt 3 is terminal.
+    // Drain until 3 attempts with a generous deadline (avoids tight sleep races).
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut total = 0usize;
-    for _ in 0..12 {
+    while total < 3 && Instant::now() < deadline {
         total += app.run_worker(None).await.unwrap();
         if total >= 3 {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(70)).await;
+        // Wait at least the nack delay for delayed requeue to become claimable.
+        tokio::time::sleep(nack_delay + Duration::from_millis(30)).await;
     }
-    assert_eq!(total, 3, "should process 3 attempts");
+    assert_eq!(total, 3, "should process 3 attempts before deadline");
 
     match app.get_result(id).await.unwrap() {
         JobResult::Failure { message } => assert!(message.contains("boom")),
@@ -435,23 +444,25 @@ async fn worker_retries_failure_then_terminal_ack() {
 
 #[tokio::test]
 async fn worker_retries_panic_then_terminal_ack() {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
+    let nack_delay = Duration::from_millis(50);
     let app = App::new(MemoryBroker::new())
         .with_result_backend(MemoryResultBackend::new())
         .with_max_attempts(3)
-        .with_nack_delay(Duration::from_millis(50));
+        .with_nack_delay(nack_delay);
     app.register::<Panics>().await.unwrap();
 
     let id = app.send::<Panics>(&Empty).await.unwrap();
 
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut total = 0usize;
-    for _ in 0..12 {
+    while total < 3 && Instant::now() < deadline {
         total += app.run_worker(None).await.unwrap();
         if total >= 3 {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(70)).await;
+        tokio::time::sleep(nack_delay + Duration::from_millis(30)).await;
     }
     assert_eq!(total, 3);
 
@@ -463,6 +474,60 @@ async fn worker_retries_panic_then_terminal_ack() {
     assert!(
         app.broker()
             .claim(&[], Duration::from_secs(30), Duration::ZERO)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn late_ack_after_recover_does_not_steal_new_claim() {
+    use std::time::Duration;
+
+    let broker = MemoryBroker::new();
+    let mut job = Job::new("add", br#"{"x":1,"y":2}"#.to_vec());
+    job.queue = QueueName::default();
+    let id = broker.enqueue(job).await.unwrap();
+
+    let short_lease = Duration::from_millis(60);
+    let claim_a = broker
+        .claim(&[QueueName::default()], short_lease, Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("claim A");
+    assert_eq!(claim_a.job.id, id);
+    assert_eq!(claim_a.job.attempts, 1);
+    let token_a = claim_a.claim_token;
+
+    // Expire lease and let recover requeue, then claim B.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let claim_b = broker
+        .claim(
+            &[QueueName::default()],
+            Duration::from_secs(30),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap()
+        .expect("claim B after recover");
+    assert_eq!(claim_b.job.id, id);
+    assert_eq!(claim_b.job.attempts, 2);
+    assert_ne!(token_a, claim_b.claim_token);
+
+    // Late ack from A must fail and must not destroy B's claim.
+    let err = broker.ack(&id, &token_a).await.unwrap_err();
+    assert!(matches!(err, CapivaraError::JobNotFound { .. }));
+
+    // B still owns the claim and can settle.
+    broker.ack(&id, &claim_b.claim_token).await.unwrap();
+
+    assert!(
+        broker
+            .claim(
+                &[QueueName::default()],
+                Duration::from_secs(30),
+                Duration::ZERO
+            )
             .await
             .unwrap()
             .is_none()

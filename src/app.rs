@@ -56,8 +56,10 @@ impl App {
     }
 
     /// Max claim attempts before a failure is terminal (default 3).
+    ///
+    /// Values below 1 are clamped to 1 (every claim is at least one attempt).
     pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
-        self.max_attempts = max_attempts;
+        self.max_attempts = max_attempts.max(1);
         self
     }
 

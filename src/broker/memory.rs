@@ -3,7 +3,7 @@
 //! **Not multi-process:** a `MemoryBroker` is not shared across OS processes.
 //! Use [`super::RedisBroker`] (feature `redis`) for real distributed workers.
 
-use crate::broker::{Broker, ClaimedJob, NackAction};
+use crate::broker::{Broker, ClaimToken, ClaimedJob, NackAction};
 use crate::error::{CapivaraError, Result};
 use crate::job::{Job, JobId, QueueName};
 use async_trait::async_trait;
@@ -28,6 +28,7 @@ struct Inner {
 struct InFlight {
     job: Job,
     lease_until: Instant,
+    token: ClaimToken,
 }
 
 impl MemoryBroker {
@@ -103,14 +104,16 @@ impl Broker for MemoryBroker {
                         if let Some(mut job) = deque.pop_front() {
                             job.attempts = job.attempts.saturating_add(1);
                             let lease_until = Instant::now() + lease;
+                            let claim_token = ClaimToken::new();
                             guard.in_flight.insert(
                                 job.id.0,
                                 InFlight {
                                     job: job.clone(),
                                     lease_until,
+                                    token: claim_token.clone(),
                                 },
                             );
-                            return Ok(Some(ClaimedJob { job }));
+                            return Ok(Some(ClaimedJob { job, claim_token }));
                         }
                     }
                 }
@@ -126,16 +129,26 @@ impl Broker for MemoryBroker {
         }
     }
 
-    async fn ack(&self, id: &JobId) -> Result<()> {
+    async fn ack(&self, id: &JobId, claim_token: &ClaimToken) -> Result<()> {
         let mut guard = self.inner.lock().await;
-        if guard.in_flight.remove(&id.0).is_none() {
-            return Err(CapivaraError::JobNotFound { id: id.to_string() });
+        match guard.in_flight.get(&id.0) {
+            Some(flight) if &flight.token == claim_token => {
+                guard.in_flight.remove(&id.0);
+                Ok(())
+            }
+            _ => Err(CapivaraError::JobNotFound { id: id.to_string() }),
         }
-        Ok(())
     }
 
-    async fn nack(&self, id: &JobId, action: NackAction) -> Result<()> {
+    async fn nack(&self, id: &JobId, claim_token: &ClaimToken, action: NackAction) -> Result<()> {
         let mut guard = self.inner.lock().await;
+        let matches = guard
+            .in_flight
+            .get(&id.0)
+            .is_some_and(|f| &f.token == claim_token);
+        if !matches {
+            return Err(CapivaraError::JobNotFound { id: id.to_string() });
+        }
         let Some(InFlight { job, .. }) = guard.in_flight.remove(&id.0) else {
             return Err(CapivaraError::JobNotFound { id: id.to_string() });
         };
