@@ -21,19 +21,35 @@ struct Inner {
     /// queue name -> pending jobs
     pending: HashMap<String, VecDeque<Job>>,
     in_flight: HashMap<uuid::Uuid, InFlight>,
-    /// delayed requeue (minimal; PR-B aligns Redis semantics)
+    /// delayed requeue; promoted on claim when due
     delayed: Vec<(Instant, Job)>,
 }
 
 struct InFlight {
     job: Job,
-    #[allow(dead_code)]
     lease_until: Instant,
 }
 
 impl MemoryBroker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Move jobs whose lease expired back to pending (worker crash / no ack).
+    fn recover_expired(inner: &mut Inner) {
+        let now = Instant::now();
+        let expired: Vec<uuid::Uuid> = inner
+            .in_flight
+            .iter()
+            .filter(|(_, f)| f.lease_until <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            if let Some(InFlight { job, .. }) = inner.in_flight.remove(&id) {
+                let q = job.queue.as_str().to_string();
+                inner.pending.entry(q).or_default().push_back(job);
+            }
+        }
     }
 
     fn promote_delayed(inner: &mut Inner) {
@@ -71,6 +87,9 @@ impl Broker for MemoryBroker {
         loop {
             {
                 let mut guard = self.inner.lock().await;
+                // Recover expired leases before promoting delayed so reclaimed
+                // jobs are claimable in this same pass.
+                Self::recover_expired(&mut guard);
                 Self::promote_delayed(&mut guard);
 
                 let queue_names: Vec<String> = if queues.is_empty() {

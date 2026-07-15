@@ -3,8 +3,8 @@
 //! These prove the Celery-like *topology* without Redis.
 
 use capivara::{
-    App, CapivaraError, Job, JobId, JobResult, MemoryBroker, MemoryResultBackend, QueueName, Task,
-    TaskError,
+    App, Broker, CapivaraError, Job, JobId, JobResult, MemoryBroker, MemoryResultBackend,
+    QueueName, Task, TaskError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -80,7 +80,10 @@ async fn success_roundtrip_with_results() {
 
 #[tokio::test]
 async fn task_err_stores_failure() {
-    let app = App::new(MemoryBroker::new()).with_result_backend(MemoryResultBackend::new());
+    // Single-shot terminal failure for result storage assertion.
+    let app = App::new(MemoryBroker::new())
+        .with_result_backend(MemoryResultBackend::new())
+        .with_max_attempts(1);
     app.register::<Fails>().await.unwrap();
 
     let id = app.send::<Fails>(&Empty).await.unwrap();
@@ -94,7 +97,10 @@ async fn task_err_stores_failure() {
 
 #[tokio::test]
 async fn panic_is_isolated_and_second_job_runs() {
-    let app = App::new(MemoryBroker::new()).with_result_backend(MemoryResultBackend::new());
+    // max_attempts=1 so panic is terminal in one drain (retry policy covered elsewhere).
+    let app = App::new(MemoryBroker::new())
+        .with_result_backend(MemoryResultBackend::new())
+        .with_max_attempts(1);
     app.register::<Panics>().await.unwrap();
     app.register::<Add>().await.unwrap();
 
@@ -147,7 +153,10 @@ async fn send_unregistered_errors() {
 async fn bad_json_payload_stores_failure() {
     // Worker deserialize path: job name matches a registered task, payload is not JSON.
     // CapivaraError::Serialize is used for both encode and decode (serde_json::Error).
-    let app = App::new(MemoryBroker::new()).with_result_backend(MemoryResultBackend::new());
+    // max_attempts=1 so a single drain ends in terminal ack (retry policy covered elsewhere).
+    let app = App::new(MemoryBroker::new())
+        .with_result_backend(MemoryResultBackend::new())
+        .with_max_attempts(1);
     app.register::<Add>().await.unwrap();
 
     let job = Job::new(Add::NAME, b"this-is-not-json".to_vec());
@@ -347,4 +356,115 @@ async fn with_default_queue_is_applied_on_send() {
     assert_eq!(job.job.id, id);
     assert_eq!(job.job.queue.as_str(), "emails");
     app.broker().ack(&job.job.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn lease_expires_then_reclaimed() {
+    let broker = MemoryBroker::new();
+    let mut job = Job::new("add", br#"{"x":1,"y":2}"#.to_vec());
+    job.queue = QueueName::default();
+    let id = broker.enqueue(job).await.unwrap();
+
+    let short_lease = std::time::Duration::from_millis(80);
+    let claimed = broker
+        .claim(
+            &[QueueName::default()],
+            short_lease,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap()
+        .expect("first claim");
+    assert_eq!(claimed.job.id, id);
+    assert_eq!(claimed.job.attempts, 1);
+
+    // Do not ack — wait past lease, then reclaim.
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+    let again = broker
+        .claim(
+            &[QueueName::default()],
+            short_lease,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap()
+        .expect("reclaimed after lease expiry");
+    assert_eq!(again.job.id, id);
+    assert_eq!(again.job.attempts, 2);
+    broker.ack(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_retries_failure_then_terminal_ack() {
+    use std::time::Duration;
+
+    let app = App::new(MemoryBroker::new())
+        .with_result_backend(MemoryResultBackend::new())
+        .with_max_attempts(3)
+        .with_nack_delay(Duration::from_millis(50));
+    app.register::<Fails>().await.unwrap();
+
+    let id = app.send::<Fails>(&Empty).await.unwrap();
+
+    // Drain passes: each failure nacks with delay until attempt 3 is terminal.
+    let mut total = 0usize;
+    for _ in 0..12 {
+        total += app.run_worker(None).await.unwrap();
+        if total >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(70)).await;
+    }
+    assert_eq!(total, 3, "should process 3 attempts");
+
+    match app.get_result(id).await.unwrap() {
+        JobResult::Failure { message } => assert!(message.contains("boom")),
+        JobResult::Success { .. } => panic!("expected failure"),
+    }
+
+    // Terminal ack — not claimable.
+    assert!(
+        app.broker()
+            .claim(&[], Duration::from_secs(30), Duration::ZERO)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn worker_retries_panic_then_terminal_ack() {
+    use std::time::Duration;
+
+    let app = App::new(MemoryBroker::new())
+        .with_result_backend(MemoryResultBackend::new())
+        .with_max_attempts(3)
+        .with_nack_delay(Duration::from_millis(50));
+    app.register::<Panics>().await.unwrap();
+
+    let id = app.send::<Panics>(&Empty).await.unwrap();
+
+    let mut total = 0usize;
+    for _ in 0..12 {
+        total += app.run_worker(None).await.unwrap();
+        if total >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(70)).await;
+    }
+    assert_eq!(total, 3);
+
+    match app.get_result(id).await.unwrap() {
+        JobResult::Failure { message } => assert!(message.to_lowercase().contains("panic")),
+        JobResult::Success { .. } => panic!("expected panic failure"),
+    }
+
+    assert!(
+        app.broker()
+            .claim(&[], Duration::from_secs(30), Duration::ZERO)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

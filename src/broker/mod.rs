@@ -43,11 +43,13 @@ pub trait Broker: Send + Sync {
 
     /// Claim the next available job from any of `queues`.
     ///
-    /// - `lease`: how long the worker may hold the job before a recoverer (PR-B)
-    ///   is allowed to steal it. Brokers should record this even if recoverer
-    ///   is not running yet.
+    /// - `lease`: how long the worker may hold the job before recover-on-claim
+    ///   is allowed to return it to pending.
     /// - `block_for`: max time to wait for a job. Zero means non-blocking
     ///   (return `Ok(None)` immediately if empty).
+    ///
+    /// On each claim loop iteration brokers recover expired leases, then promote
+    /// due delayed jobs, then try to claim.
     async fn claim(
         &self,
         queues: &[QueueName],
@@ -58,8 +60,8 @@ pub trait Broker: Send + Sync {
     /// Complete this claim attempt: drop the lease / in-flight entry.
     ///
     /// Does **not** imply the task handler succeeded — the worker may `ack`
-    /// after storing a failure result (PR-A always-acks; PR-B may nack-retry
-    /// instead). Call only when this worker currently holds the claim.
+    /// after storing a failure result when attempts are exhausted (or for
+    /// unknown tasks). Call only when this worker currently holds the claim.
     async fn ack(&self, id: &JobId) -> Result<()>;
 
     /// Negative-ack: requeue according to `action` (no DLQ in M1).

@@ -226,3 +226,96 @@ async fn redis_nack_delayed_then_promoted() {
     assert_eq!(again.job.id, id);
     broker.ack(&id).await.unwrap();
 }
+
+#[tokio::test]
+async fn redis_lease_expires_then_reclaimed() {
+    let (_guard, url) = redis_url().await;
+    let broker = RedisBroker::connect(RedisConfig::new(url).with_prefix("capivara_lease:"))
+        .await
+        .unwrap();
+
+    let mut job = Job::new("ping", br#"{"msg":"lease"}"#.to_vec());
+    job.queue = QueueName::default();
+    let id = broker.enqueue(job).await.unwrap();
+
+    let short_lease = Duration::from_millis(200);
+    let claimed = broker
+        .claim(&[QueueName::default()], short_lease, Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("first claim");
+    assert_eq!(claimed.job.id, id);
+    assert_eq!(claimed.job.attempts, 1);
+
+    // Do not ack — wait past lease, then reclaim via recover-on-claim.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    let again = broker
+        .claim(&[QueueName::default()], short_lease, Duration::from_secs(1))
+        .await
+        .unwrap()
+        .expect("reclaimed after lease expiry");
+    assert_eq!(again.job.id, id);
+    assert_eq!(again.job.attempts, 2);
+    broker.ack(&id).await.unwrap();
+}
+
+struct AlwaysFails;
+
+impl Task for AlwaysFails {
+    const NAME: &'static str = "always_fails";
+    type Args = PingArgs;
+    type Output = PingResult;
+
+    async fn run(_args: Self::Args) -> Result<Self::Output, TaskError> {
+        Err(TaskError::new("always fails"))
+    }
+}
+
+#[tokio::test]
+async fn redis_worker_retries_then_terminal() {
+    let (_guard, url) = redis_url().await;
+    let broker = RedisBroker::connect(RedisConfig::new(url).with_prefix("capivara_retry:"))
+        .await
+        .unwrap();
+
+    let app = App::new(broker)
+        .with_result_backend(MemoryResultBackend::new())
+        .with_max_attempts(3)
+        .with_nack_delay(Duration::from_millis(80));
+    app.register::<AlwaysFails>().await.unwrap();
+
+    let id = app
+        .send::<AlwaysFails>(&PingArgs {
+            msg: "retry-me".into(),
+        })
+        .await
+        .unwrap();
+
+    let mut total = 0usize;
+    for _ in 0..15 {
+        total += app.run_worker(None).await.unwrap();
+        if total >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+    assert_eq!(total, 3, "three attempts then terminal");
+
+    match app.get_result(id).await.unwrap() {
+        JobResult::Failure { message } => assert!(message.contains("always fails")),
+        JobResult::Success { .. } => panic!("expected failure"),
+    }
+
+    // Not claimable after terminal ack.
+    let none = app
+        .broker()
+        .claim(
+            &[QueueName::default()],
+            Duration::from_secs(30),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert!(none.is_none());
+}

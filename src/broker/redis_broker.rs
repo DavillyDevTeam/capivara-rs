@@ -6,10 +6,10 @@
 //!
 //! - `{prefix}q:{queue}:pending` — LIST of job id strings (ready)
 //! - `{prefix}job:{id}` — STRING JSON [`Job`]
-//! - `{prefix}lease` — ZSET score = lease expiry (unix ms), member = job id
-//! - `{prefix}delayed` — ZSET score = available_at (unix ms), member = job id
+//! - `{prefix}lease` — ZSET score = lease expiry (unix ms), member = `{queue}\x1f{id}`
+//! - `{prefix}delayed` — ZSET score = available_at (unix ms), member = `{queue}\x1f{id}`
 //!
-//! Claim / promote / ack paths use **Lua** so multi-worker races cannot
+//! Claim / promote / recover / ack paths use **Lua** so multi-worker races cannot
 //! double-enqueue or delete unowned job bodies.
 
 use crate::broker::{Broker, ClaimedJob, NackAction};
@@ -19,6 +19,9 @@ use async_trait::async_trait;
 use redis::Script;
 use redis::aio::ConnectionManager;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Unit separator used in lease/delayed ZSET members: `{queue}\x1f{job_id}`.
+const MEMBER_SEP: char = '\u{001f}';
 
 /// Connection / key-namespace settings for [`RedisBroker`].
 #[derive(Debug, Clone)]
@@ -48,10 +51,10 @@ pub struct RedisBroker {
     claim_script: Script,
     ack_script: Script,
     nack_script: Script,
-    /// Atomically: for each due delayed id, ZREM then LPUSH only if we won ZREM.
-    /// KEYS[1]=delayed, ARGV[1]=now_ms, ARGV[2]=job key prefix (capivara:job:)
-    /// Returns number of jobs promoted.
+    /// Atomically: for each due delayed member, ZREM then LPUSH only if we won ZREM.
     promote_script: Script,
+    /// Atomically: for each expired lease member, ZREM then LPUSH only if we won ZREM.
+    recover_script: Script,
 }
 
 impl RedisBroker {
@@ -64,7 +67,8 @@ impl RedisBroker {
             .map_err(|e| CapivaraError::Broker(e.to_string()))?;
 
         // KEYS[1] = pending list, KEYS[2] = lease zset
-        // ARGV[1] = job key prefix (e.g. capivara:job:), ARGV[2] = lease expiry ms
+        // ARGV[1] = job key prefix, ARGV[2] = lease expiry ms, ARGV[3] = queue name
+        // Lease member format: "{queue}\x1f{id}" (same as delayed) so recoverer needs no JSON.
         let claim_script = Script::new(
             r#"
             local id = redis.call('RPOP', KEYS[1])
@@ -76,13 +80,15 @@ impl RedisBroker {
             if not body then
               return nil
             end
-            redis.call('ZADD', KEYS[2], ARGV[2], id)
+            local sep = string.char(0x1f)
+            local member = ARGV[3] .. sep .. id
+            redis.call('ZADD', KEYS[2], ARGV[2], member)
             return body
             "#,
         );
 
         // Only delete the job body if we actually held the lease.
-        // KEYS[1] = lease zset, ARGV[1] = job key, ARGV[2] = id
+        // KEYS[1] = lease zset, ARGV[1] = job key, ARGV[2] = lease member
         let ack_script = Script::new(
             r#"
             local removed = redis.call('ZREM', KEYS[1], ARGV[2])
@@ -94,13 +100,13 @@ impl RedisBroker {
         );
 
         // KEYS[1]=lease, KEYS[2]=pending or delayed
-        // ARGV[1]=job key, ARGV[2]=id, ARGV[3]=mode ('pending'|'delayed'), ARGV[4]=score if delayed
-        // ARGV[1]=job key, ARGV[2]=id (lease member), ARGV[3]=mode,
-        // ARGV[4]=score if delayed, ARGV[5]=delayed member ("queue\x1fid") if delayed
+        // ARGV[1]=job key, ARGV[2]=lease member, ARGV[3]=mode ('pending'|'delayed'),
+        // ARGV[4]=score if delayed, ARGV[5]=delayed member if delayed,
+        // ARGV[6]=pending list member (bare job id) if pending
         let nack_script = Script::new(
             r#"
-            local id = ARGV[2]
-            local removed = redis.call('ZREM', KEYS[1], id)
+            local member = ARGV[2]
+            local removed = redis.call('ZREM', KEYS[1], member)
             if removed == 0 then
               return 0
             end
@@ -109,7 +115,7 @@ impl RedisBroker {
               return 0
             end
             if ARGV[3] == 'pending' then
-              redis.call('LPUSH', KEYS[2], id)
+              redis.call('LPUSH', KEYS[2], ARGV[6])
             else
               redis.call('ZADD', KEYS[2], ARGV[4], ARGV[5])
             end
@@ -117,12 +123,8 @@ impl RedisBroker {
             "#,
         );
 
-        // KEYS[1]=delayed zset
-        // ARGV[1]=now_ms, ARGV[2]=job key prefix
-        // For each due id: ZREM (win) → GET body → LPUSH to that job's pending queue.
-        // Only the worker that wins ZREM may LPUSH (no double-enqueue).
-        // Delayed ZSET member format: "{queue}\x1f{job_id}" so we never need cjson.
         // KEYS[1]=delayed, ARGV[1]=now_ms, ARGV[2]=pending key prefix ("{prefix}q:")
+        // Delayed ZSET member format: "{queue}\x1f{job_id}" so we never need cjson.
         let promote_script = Script::new(
             r#"
             local members = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
@@ -144,6 +146,29 @@ impl RedisBroker {
             "#,
         );
 
+        // KEYS[1]=lease, ARGV[1]=now_ms, ARGV[2]=pending key prefix ("{prefix}q:")
+        // Lease member format matches delayed: "{queue}\x1f{job_id}".
+        let recover_script = Script::new(
+            r#"
+            local members = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+            local recovered = 0
+            local sep = string.char(0x1f)
+            for _, member in ipairs(members) do
+              if redis.call('ZREM', KEYS[1], member) == 1 then
+                local pos = string.find(member, sep, 1, true)
+                if pos then
+                  local q = string.sub(member, 1, pos - 1)
+                  local id = string.sub(member, pos + 1)
+                  local pending = ARGV[2] .. q .. ':pending'
+                  redis.call('LPUSH', pending, id)
+                  recovered = recovered + 1
+                end
+              end
+            end
+            return recovered
+            "#,
+        );
+
         Ok(Self {
             conn,
             prefix: config.prefix,
@@ -151,6 +176,7 @@ impl RedisBroker {
             ack_script,
             nack_script,
             promote_script,
+            recover_script,
         })
     }
 
@@ -179,11 +205,29 @@ impl RedisBroker {
         format!("{}delayed", self.prefix)
     }
 
+    fn lease_member(queue: &str, id: &JobId) -> String {
+        format!("{queue}{MEMBER_SEP}{id}")
+    }
+
     fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
+    }
+
+    /// Reclaim jobs whose lease expired (worker crashed / stuck without ack/nack).
+    async fn recover_expired_leases(&self) -> Result<()> {
+        let mut conn = self.conn.clone();
+        let _: i32 = self
+            .recover_script
+            .key(self.lease_key())
+            .arg(Self::now_ms())
+            .arg(self.pending_key_prefix())
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| CapivaraError::Broker(e.to_string()))?;
+        Ok(())
     }
 
     /// Promote due delayed jobs. Queue filter is applied after promote by claim
@@ -213,6 +257,7 @@ impl RedisBroker {
             .key(&lease_key)
             .arg(self.job_key_prefix())
             .arg(expiry)
+            .arg(queue)
             .invoke_async(&mut conn)
             .await
             .map_err(|e| CapivaraError::Broker(e.to_string()))?;
@@ -233,6 +278,21 @@ impl RedisBroker {
             .map_err(|e| CapivaraError::Broker(e.to_string()))?;
 
         Ok(Some(ClaimedJob { job }))
+    }
+
+    /// Load job body for id; used by ack/nack to build lease member from queue.
+    async fn get_job(&self, id: &JobId) -> Result<Job> {
+        let mut conn = self.conn.clone();
+        let job_key = self.job_key(id);
+        let body: Option<String> = redis::cmd("GET")
+            .arg(&job_key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CapivaraError::Broker(e.to_string()))?;
+        let Some(body) = body else {
+            return Err(CapivaraError::JobNotFound { id: id.to_string() });
+        };
+        Ok(serde_json::from_str(&body)?)
     }
 }
 
@@ -276,6 +336,9 @@ impl Broker for RedisBroker {
 
         let deadline = Instant::now() + block_for;
         loop {
+            // Recover expired leases before promoting delayed so reclaimed jobs
+            // are claimable in this same pass.
+            self.recover_expired_leases().await?;
             self.promote_delayed().await?;
 
             for q in &queue_names {
@@ -294,12 +357,14 @@ impl Broker for RedisBroker {
     }
 
     async fn ack(&self, id: &JobId) -> Result<()> {
+        let job = self.get_job(id).await?;
+        let member = Self::lease_member(job.queue.as_str(), id);
         let mut conn = self.conn.clone();
         let removed: i32 = self
             .ack_script
             .key(self.lease_key())
             .arg(self.job_key(id))
-            .arg(id.to_string())
+            .arg(member)
             .invoke_async(&mut conn)
             .await
             .map_err(|e| CapivaraError::Broker(e.to_string()))?;
@@ -312,15 +377,8 @@ impl Broker for RedisBroker {
     async fn nack(&self, id: &JobId, action: NackAction) -> Result<()> {
         let mut conn = self.conn.clone();
         let job_key = self.job_key(id);
-        let body: Option<String> = redis::cmd("GET")
-            .arg(&job_key)
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| CapivaraError::Broker(e.to_string()))?;
-        let Some(body) = body else {
-            return Err(CapivaraError::JobNotFound { id: id.to_string() });
-        };
-        let job: Job = serde_json::from_str(&body)?;
+        let job = self.get_job(id).await?;
+        let lease_member = Self::lease_member(job.queue.as_str(), id);
 
         match action {
             NackAction::RequeueAfter { delay } => {
@@ -331,10 +389,11 @@ impl Broker for RedisBroker {
                         .key(self.lease_key())
                         .key(&pending)
                         .arg(&job_key)
-                        .arg(id.to_string())
+                        .arg(&lease_member)
                         .arg("pending")
                         .arg(0)
                         .arg("")
+                        .arg(id.to_string())
                         .invoke_async(&mut conn)
                         .await
                         .map_err(|e| CapivaraError::Broker(e.to_string()))?;
@@ -344,17 +403,17 @@ impl Broker for RedisBroker {
                 } else {
                     let score = Self::now_ms() + delay.as_millis() as u64;
                     let delayed = self.delayed_key();
-                    let delayed_member =
-                        format!("{}{}{}", job.queue.as_str(), char::from(0x1f), id);
+                    let delayed_member = Self::lease_member(job.queue.as_str(), id);
                     let ok: i32 = self
                         .nack_script
                         .key(self.lease_key())
                         .key(&delayed)
                         .arg(&job_key)
-                        .arg(id.to_string())
+                        .arg(&lease_member)
                         .arg("delayed")
                         .arg(score)
                         .arg(&delayed_member)
+                        .arg("")
                         .invoke_async(&mut conn)
                         .await
                         .map_err(|e| CapivaraError::Broker(e.to_string()))?;
