@@ -14,7 +14,7 @@ authors = ["Duarte Mainart Tecnologia e Publicidade LTDA"]
 
 [features]
 default = []
-# Opt-in Redis broker (and later Redis results in PR-C). Memory backends need no feature.
+# Opt-in Redis broker + Redis result backend. Memory backends need no feature.
 redis = ["dep:redis"]
 
 [dependencies]

@@ -5,7 +5,7 @@
 
 use capivara::{
     App, Broker, CapivaraError, Job, JobResult, MemoryResultBackend, NackAction, QueueName,
-    RedisBroker, RedisConfig, Task, TaskError,
+    RedisBroker, RedisConfig, RedisResultBackend, Task, TaskError,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -120,6 +120,71 @@ async fn redis_app_roundtrip_with_memory_results() {
             assert_eq!(out.echo, "hello");
         }
         JobResult::Failure { message } => panic!("{message}"),
+    }
+}
+
+#[tokio::test]
+async fn redis_app_roundtrip_with_redis_results() {
+    let (_guard, url) = redis_url().await;
+    let prefix = "capivara_redis_results:";
+    let config = RedisConfig::new(url).with_prefix(prefix);
+    let broker = RedisBroker::connect(config.clone()).await.unwrap();
+    let results = RedisResultBackend::connect(config).await.unwrap();
+    let app = App::new(broker).with_result_backend(results);
+    app.register::<Ping>().await.unwrap();
+
+    let id = app
+        .send::<Ping>(&PingArgs {
+            msg: "redis-result".into(),
+        })
+        .await
+        .unwrap();
+    let n = app.run_worker(None).await.unwrap();
+    assert_eq!(n, 1);
+
+    match app.get_result(id).await.unwrap() {
+        JobResult::Success { payload } => {
+            let out: PingResult = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(out.echo, "redis-result");
+        }
+        JobResult::Failure { message } => panic!("{message}"),
+    }
+}
+
+#[tokio::test]
+async fn redis_concurrency_smoke() {
+    let (_guard, url) = redis_url().await;
+    let prefix = "capivara_redis_conc:";
+    let config = RedisConfig::new(url).with_prefix(prefix);
+    let broker = RedisBroker::connect(config.clone()).await.unwrap();
+    let results = RedisResultBackend::connect(config).await.unwrap();
+    let app = App::new(broker)
+        .with_result_backend(results)
+        .with_concurrency(4);
+    app.register::<Ping>().await.unwrap();
+
+    let mut ids = Vec::new();
+    for i in 0..8 {
+        let id = app
+            .send::<Ping>(&PingArgs {
+                msg: format!("c{i}"),
+            })
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+
+    let n = app.run_worker(None).await.unwrap();
+    assert_eq!(n, 8);
+
+    for (i, id) in ids.into_iter().enumerate() {
+        match app.get_result(id).await.unwrap() {
+            JobResult::Success { payload } => {
+                let out: PingResult = serde_json::from_slice(&payload).unwrap();
+                assert_eq!(out.echo, format!("c{i}"));
+            }
+            JobResult::Failure { message } => panic!("job {i}: {message}"),
+        }
     }
 }
 

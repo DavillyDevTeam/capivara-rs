@@ -79,6 +79,33 @@ async fn success_roundtrip_with_results() {
 }
 
 #[tokio::test]
+async fn concurrency_processes_several_jobs() {
+    let app = App::new(MemoryBroker::new())
+        .with_result_backend(MemoryResultBackend::new())
+        .with_concurrency(4);
+    app.register::<Add>().await.unwrap();
+
+    let mut ids = Vec::new();
+    for i in 0..8 {
+        ids.push(app.send::<Add>(&AddArgs { x: i, y: i * 10 }).await.unwrap());
+    }
+
+    let n = app.run_worker(None).await.unwrap();
+    assert_eq!(n, 8);
+
+    for (i, id) in ids.into_iter().enumerate() {
+        match app.get_result(id).await.unwrap() {
+            JobResult::Success { payload } => {
+                let out: AddResult = serde_json::from_slice(&payload).unwrap();
+                let i = i as i32;
+                assert_eq!(out.sum, i + i * 10);
+            }
+            JobResult::Failure { message } => panic!("job {i}: {message}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn task_err_stores_failure() {
     // Single-shot terminal failure for result storage assertion.
     let app = App::new(MemoryBroker::new())
