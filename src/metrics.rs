@@ -18,6 +18,9 @@
 //!
 //! # Status values (`capivara_jobs_completed_total`)
 //!
+//! Recorded only when settle confirms claim ownership (lost-lease `JobNotFound`
+//! is a no-op and does **not** increment the counter — same for all three):
+//!
 //! - `success` — handler succeeded and claim was settled with `ack`
 //! - `failure` — handler failed/panicked and claim was `nack`ed for retry
 //! - `dead` — claim was moved to the dead-letter queue (terminal)

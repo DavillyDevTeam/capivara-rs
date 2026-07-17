@@ -234,6 +234,7 @@ exporter in your binary (e.g. `metrics-exporter-prometheus`).
 | `capivara_queue_depth` | gauge | `queue` (best-effort) |
 
 `status` values: `success` (acked), `failure` (nacked for retry), `dead` (dead-lettered).
+Each is recorded only when settle confirms claim ownership (lost-lease races do not inflate counters).
 
 **Cardinality:** never label by `job_id`.
 

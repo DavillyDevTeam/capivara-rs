@@ -193,6 +193,10 @@ impl Worker {
     }
 
     /// Ack; treat lost ownership as non-fatal so the drain keeps going.
+    ///
+    /// Returns `Ok(true)` if ownership was confirmed and the claim was acked.
+    /// Returns `Ok(false)` if the claim was already lost (`JobNotFound`) so the
+    /// caller can skip completion metrics (mirrors [`Self::settle_dead_letter`]).
     async fn settle_ack(
         broker: &Arc<dyn Broker>,
         id: &JobId,
@@ -200,7 +204,7 @@ impl Worker {
         task_name: &str,
         queue: &str,
         attempt: u32,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let span = tracing::info_span!(
             "capivara.ack",
             job.id = %id,
@@ -210,8 +214,8 @@ impl Worker {
         );
         async {
             match broker.ack(id, claim_token).await {
-                Ok(()) => Ok(()),
-                Err(CapivaraError::JobNotFound { .. }) => Ok(()),
+                Ok(()) => Ok(true),
+                Err(CapivaraError::JobNotFound { .. }) => Ok(false),
                 Err(e) => Err(e),
             }
         }
@@ -220,6 +224,10 @@ impl Worker {
     }
 
     /// Nack; treat lost ownership as non-fatal so the drain keeps going.
+    ///
+    /// Returns `Ok(true)` if ownership was confirmed and the nack applied.
+    /// Returns `Ok(false)` if the claim was already lost (`JobNotFound`) so the
+    /// caller can skip completion metrics (mirrors [`Self::settle_dead_letter`]).
     async fn settle_nack(
         broker: &Arc<dyn Broker>,
         id: &JobId,
@@ -228,7 +236,7 @@ impl Worker {
         task_name: &str,
         queue: &str,
         attempt: u32,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let span = tracing::info_span!(
             "capivara.nack",
             job.id = %id,
@@ -238,8 +246,8 @@ impl Worker {
         );
         async {
             match broker.nack(id, claim_token, action).await {
-                Ok(()) => Ok(()),
-                Err(CapivaraError::JobNotFound { .. }) => Ok(()),
+                Ok(()) => Ok(true),
+                Err(CapivaraError::JobNotFound { .. }) => Ok(false),
                 Err(e) => Err(e),
             }
         }
@@ -388,15 +396,26 @@ async fn process_one(
                         .store(&job_id, JobResult::Success { payload })
                         .await?;
                 }
-                Worker::settle_ack(&broker, &job_id, &claim_token, &task_name, &queue, attempts)
-                    .await?;
-                metrics::record_completed(&queue, &task_name, CompletionStatus::Success);
+                // Only count success when this claim still owned the settle
+                // (lost-lease JobNotFound is a no-op; another claim may complete).
+                let owned = Worker::settle_ack(
+                    &broker,
+                    &job_id,
+                    &claim_token,
+                    &task_name,
+                    &queue,
+                    attempts,
+                )
+                .await?;
+                if owned {
+                    metrics::record_completed(&queue, &task_name, CompletionStatus::Success);
+                }
             }
             JobResult::Failure { message } => {
                 if attempts < retry_policy.max_attempts {
                     // Intermediate retry: do **not** store Failure.
                     let delay = retry_policy.delay_for_attempt(attempts);
-                    Worker::settle_nack(
+                    let owned = Worker::settle_nack(
                         &broker,
                         &job_id,
                         &claim_token,
@@ -406,7 +425,9 @@ async fn process_one(
                         attempts,
                     )
                     .await?;
-                    metrics::record_completed(&queue, &task_name, CompletionStatus::Failure);
+                    if owned {
+                        metrics::record_completed(&queue, &task_name, CompletionStatus::Failure);
+                    }
                 } else {
                     // Terminal: dead_letter first; store Failure only if we still own
                     // the claim (avoids Failure while another claim may still run).
