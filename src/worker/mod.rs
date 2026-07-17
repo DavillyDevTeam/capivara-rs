@@ -1,20 +1,24 @@
-//! Worker loop: claim → run → store result? → ack.
+//! Worker loop: claim → run → store result? → ack or delayed nack.
 //!
 //! Celery analogy: the consumer process. With Redis this can run in another
 //! process than the producer; with Memory it stays in-process.
 
-use crate::broker::Broker;
+use crate::broker::{Broker, ClaimToken, NackAction};
 use crate::error::{CapivaraError, Result};
-use crate::job::QueueName;
+use crate::job::{JobId, QueueName};
 use crate::registry::Registry;
 use crate::result::{JobResult, ResultBackend};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Defaults for drain-style workers (memory tests / simple loops).
-const DEFAULT_LEASE: Duration = Duration::from_secs(60);
+/// Default claim lease (visibility timeout).
+pub const DEFAULT_LEASE: Duration = Duration::from_secs(30);
 /// Non-blocking claim so `run_worker` drains without sleeping when empty.
-const DEFAULT_BLOCK: Duration = Duration::ZERO;
+pub const DEFAULT_BLOCK: Duration = Duration::ZERO;
+/// Attempts before terminal ack (claim increments attempts, so attempt 3 is last).
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+/// Delay before a failed job becomes claimable again.
+pub const DEFAULT_NACK_DELAY: Duration = Duration::from_secs(5);
 
 /// Process jobs until the broker is empty (or a limit is hit).
 pub struct Worker {
@@ -23,10 +27,25 @@ pub struct Worker {
     pub results: Option<Arc<dyn ResultBackend>>,
     /// Queues to claim from (empty → `default` only).
     pub queues: Vec<QueueName>,
+    /// Claim lease duration.
+    pub lease: Duration,
+    /// Max claim attempts before terminal ack on failure.
+    pub max_attempts: u32,
+    /// Delay used for [`NackAction::RequeueAfter`] on retryable failures.
+    pub nack_delay: Duration,
 }
 
 impl Worker {
     /// Run until no more jobs can be claimed (non-blocking), or `max_jobs` is hit.
+    ///
+    /// Policy:
+    /// - Success → store Success (if backend) → ack
+    /// - Err / panic → store Failure (if backend) → nack(RequeueAfter) while
+    ///   `attempts < max_attempts`, else terminal ack
+    /// - Unknown task → store Failure (if backend) → terminal ack (not retryable)
+    ///
+    /// Lost-lease `JobNotFound` from ack/nack is non-fatal (another claim may
+    /// already own the job after recover); the drain continues.
     pub async fn run(&self, max_jobs: Option<usize>) -> Result<usize> {
         let mut processed = 0usize;
         let queues = if self.queues.is_empty() {
@@ -41,12 +60,15 @@ impl Worker {
             }
             let Some(claimed) = self
                 .broker
-                .claim(&queues, DEFAULT_LEASE, DEFAULT_BLOCK)
+                .claim(&queues, self.lease, DEFAULT_BLOCK)
                 .await?
             else {
                 break;
             };
             let job = claimed.job;
+            let claim_token = claimed.claim_token;
+            let attempts = job.attempts;
+            let job_id = job.id;
 
             let handler = match self.registry.get(&job.task_name) {
                 Ok(h) => h,
@@ -54,20 +76,20 @@ impl Worker {
                     if let Some(backend) = &self.results {
                         backend
                             .store(
-                                &job.id,
+                                &job_id,
                                 JobResult::Failure {
                                     message: e.to_string(),
                                 },
                             )
                             .await?;
                     }
-                    self.broker.ack(&job.id).await?;
+                    // Unknown task is terminal — not a retryable handler failure.
+                    Self::settle_ack(&self.broker, &job_id, &claim_token).await?;
                     processed += 1;
                     continue;
                 }
             };
 
-            let job_id = job.id;
             let payload = job.payload;
 
             // Isolate panics: spawn catches unwind as JoinError.
@@ -84,13 +106,58 @@ impl Worker {
                 },
             };
 
+            let is_success = matches!(outcome, JobResult::Success { .. });
+
             if let Some(backend) = &self.results {
                 backend.store(&job_id, outcome).await?;
             }
 
-            self.broker.ack(&job_id).await?;
+            if is_success {
+                Self::settle_ack(&self.broker, &job_id, &claim_token).await?;
+            } else if attempts < self.max_attempts {
+                Self::settle_nack(
+                    &self.broker,
+                    &job_id,
+                    &claim_token,
+                    NackAction::RequeueAfter {
+                        delay: self.nack_delay,
+                    },
+                )
+                .await?;
+            } else {
+                // Terminal failure after max attempts.
+                Self::settle_ack(&self.broker, &job_id, &claim_token).await?;
+            }
+
             processed += 1;
         }
         Ok(processed)
+    }
+
+    /// Ack; treat lost ownership as non-fatal so the drain keeps going.
+    async fn settle_ack(
+        broker: &Arc<dyn Broker>,
+        id: &JobId,
+        claim_token: &ClaimToken,
+    ) -> Result<()> {
+        match broker.ack(id, claim_token).await {
+            Ok(()) => Ok(()),
+            Err(CapivaraError::JobNotFound { .. }) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Nack; treat lost ownership as non-fatal so the drain keeps going.
+    async fn settle_nack(
+        broker: &Arc<dyn Broker>,
+        id: &JobId,
+        claim_token: &ClaimToken,
+        action: NackAction,
+    ) -> Result<()> {
+        match broker.nack(id, claim_token, action).await {
+            Ok(()) => Ok(()),
+            Err(CapivaraError::JobNotFound { .. }) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }

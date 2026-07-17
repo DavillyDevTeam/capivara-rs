@@ -13,16 +13,25 @@ a universal CLI that runs arbitrary remote code.
 | **Package** | `capivara` (repo: [`capivara-rs`](https://github.com/DavillyDevTeam/capivara-rs)) |
 | **Org** | [DavillyDevTeam](https://github.com/DavillyDevTeam) |
 | **License** | MIT OR Apache-2.0 |
-| **Status** | M0: in-process memory backends only |
+| **Status** | M1 in progress: Memory + optional Redis broker |
 
-## What works today (M0)
+## What works today (M0 / M1)
 
 - Typed **`Task`** trait (`NAME`, `Args`, `Output`, native async `run`)
 - **`App`**: `register` / `send` / `run_worker` / `get_result`
   - optional `with_result_backend`, `with_default_queue`
   - `broker()` for shared broker access / advanced raw `Job` enqueue
+  - worker policy: `with_lease` (default **30s**), `with_max_attempts` (default **3**),
+    `with_nack_delay` (default **5s**)
 - **`MemoryBroker`** + optional **`MemoryResultBackend`**
   - **Single-process only** — not shared across OS processes; not a distributed queue
+- Optional **`RedisBroker`** (`redis` feature): LIST + lease, Lua claim/ack/nack,
+  delayed requeue, **lease recover-on-claim**, **claim tokens** (late ack/nack
+  cannot steal a newer claim after recover)
+- Worker retry policy: task `Err` / panic → store Failure →
+  `nack(RequeueAfter)` until `max_attempts`, then terminal `ack`
+  (unknown task name is always terminal; lost-lease settle is non-fatal)
+- Claim-scoped ownership: each claim issues a `ClaimToken` required by `ack`/`nack`
 - Panic isolation at the task boundary (worker keeps going)
 - Results: `send` → `JobId`; `get_result` only if a backend is configured
   (stores **success and failure**); errors clearly if no backend / missing id
@@ -50,7 +59,6 @@ REDIS_URL=redis://127.0.0.1:6379/ cargo test --features redis
 
 ## Not yet
 
-- Lease **recoverer** loop & full delayed-retry worker policy (M1 PR-B)  
 - `RedisResultBackend` & worker concurrency N (M1 PR-C)  
 - DLQ / exponential backoff (M2)  
 - Proc-macro or `app.task("name", fn)` sugar  

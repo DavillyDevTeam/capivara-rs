@@ -8,8 +8,9 @@ use crate::job::{Job, JobId, QueueName};
 use crate::registry::Registry;
 use crate::result::{JobResult, ResultBackend};
 use crate::task::Task;
-use crate::worker::Worker;
+use crate::worker::{DEFAULT_LEASE, DEFAULT_MAX_ATTEMPTS, DEFAULT_NACK_DELAY, Worker};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 /// Capivara application: registry + broker + optional result backend.
@@ -18,6 +19,9 @@ pub struct App {
     broker: Arc<dyn Broker>,
     results: Option<Arc<dyn ResultBackend>>,
     default_queue: QueueName,
+    lease: Duration,
+    max_attempts: u32,
+    nack_delay: Duration,
 }
 
 impl App {
@@ -28,6 +32,9 @@ impl App {
             broker: Arc::new(broker),
             results: None,
             default_queue: QueueName::default(),
+            lease: DEFAULT_LEASE,
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            nack_delay: DEFAULT_NACK_DELAY,
         }
     }
 
@@ -39,6 +46,26 @@ impl App {
 
     pub fn with_default_queue(mut self, queue: impl Into<QueueName>) -> Self {
         self.default_queue = queue.into();
+        self
+    }
+
+    /// Claim lease duration passed to the worker (default 30s).
+    pub fn with_lease(mut self, lease: Duration) -> Self {
+        self.lease = lease;
+        self
+    }
+
+    /// Max claim attempts before a failure is terminal (default 3).
+    ///
+    /// Values below 1 are clamped to 1 (every claim is at least one attempt).
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = max_attempts.max(1);
+        self
+    }
+
+    /// Delay before requeue after a retryable failure (default 5s).
+    pub fn with_nack_delay(mut self, nack_delay: Duration) -> Self {
+        self.nack_delay = nack_delay;
         self
     }
 
@@ -86,6 +113,9 @@ impl App {
     }
 
     /// Process pending jobs in-process until the queue is empty (or `max_jobs`).
+    ///
+    /// Uses configured lease / max_attempts / nack_delay. Delayed nacks are not
+    /// waited on in a single drain pass — call again after the delay for retries.
     pub async fn run_worker(&self, max_jobs: Option<usize>) -> Result<usize> {
         let registry = {
             let guard = self.registry.lock().await;
@@ -97,6 +127,9 @@ impl App {
             broker: Arc::clone(&self.broker),
             results: self.results.clone(),
             queues: vec![self.default_queue.clone()],
+            lease: self.lease,
+            max_attempts: self.max_attempts,
+            nack_delay: self.nack_delay,
         };
         worker.run(max_jobs).await
     }

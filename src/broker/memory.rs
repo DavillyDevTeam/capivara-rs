@@ -3,7 +3,7 @@
 //! **Not multi-process:** a `MemoryBroker` is not shared across OS processes.
 //! Use [`super::RedisBroker`] (feature `redis`) for real distributed workers.
 
-use crate::broker::{Broker, ClaimedJob, NackAction};
+use crate::broker::{Broker, ClaimToken, ClaimedJob, NackAction};
 use crate::error::{CapivaraError, Result};
 use crate::job::{Job, JobId, QueueName};
 use async_trait::async_trait;
@@ -21,19 +21,36 @@ struct Inner {
     /// queue name -> pending jobs
     pending: HashMap<String, VecDeque<Job>>,
     in_flight: HashMap<uuid::Uuid, InFlight>,
-    /// delayed requeue (minimal; PR-B aligns Redis semantics)
+    /// delayed requeue; promoted on claim when due
     delayed: Vec<(Instant, Job)>,
 }
 
 struct InFlight {
     job: Job,
-    #[allow(dead_code)]
     lease_until: Instant,
+    token: ClaimToken,
 }
 
 impl MemoryBroker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Move jobs whose lease expired back to pending (worker crash / no ack).
+    fn recover_expired(inner: &mut Inner) {
+        let now = Instant::now();
+        let expired: Vec<uuid::Uuid> = inner
+            .in_flight
+            .iter()
+            .filter(|(_, f)| f.lease_until <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            if let Some(InFlight { job, .. }) = inner.in_flight.remove(&id) {
+                let q = job.queue.as_str().to_string();
+                inner.pending.entry(q).or_default().push_back(job);
+            }
+        }
     }
 
     fn promote_delayed(inner: &mut Inner) {
@@ -71,6 +88,9 @@ impl Broker for MemoryBroker {
         loop {
             {
                 let mut guard = self.inner.lock().await;
+                // Recover expired leases before promoting delayed so reclaimed
+                // jobs are claimable in this same pass.
+                Self::recover_expired(&mut guard);
                 Self::promote_delayed(&mut guard);
 
                 let queue_names: Vec<String> = if queues.is_empty() {
@@ -84,14 +104,16 @@ impl Broker for MemoryBroker {
                         if let Some(mut job) = deque.pop_front() {
                             job.attempts = job.attempts.saturating_add(1);
                             let lease_until = Instant::now() + lease;
+                            let claim_token = ClaimToken::new();
                             guard.in_flight.insert(
                                 job.id.0,
                                 InFlight {
                                     job: job.clone(),
                                     lease_until,
+                                    token: claim_token.clone(),
                                 },
                             );
-                            return Ok(Some(ClaimedJob { job }));
+                            return Ok(Some(ClaimedJob { job, claim_token }));
                         }
                     }
                 }
@@ -107,16 +129,26 @@ impl Broker for MemoryBroker {
         }
     }
 
-    async fn ack(&self, id: &JobId) -> Result<()> {
+    async fn ack(&self, id: &JobId, claim_token: &ClaimToken) -> Result<()> {
         let mut guard = self.inner.lock().await;
-        if guard.in_flight.remove(&id.0).is_none() {
-            return Err(CapivaraError::JobNotFound { id: id.to_string() });
+        match guard.in_flight.get(&id.0) {
+            Some(flight) if &flight.token == claim_token => {
+                guard.in_flight.remove(&id.0);
+                Ok(())
+            }
+            _ => Err(CapivaraError::JobNotFound { id: id.to_string() }),
         }
-        Ok(())
     }
 
-    async fn nack(&self, id: &JobId, action: NackAction) -> Result<()> {
+    async fn nack(&self, id: &JobId, claim_token: &ClaimToken, action: NackAction) -> Result<()> {
         let mut guard = self.inner.lock().await;
+        let matches = guard
+            .in_flight
+            .get(&id.0)
+            .is_some_and(|f| &f.token == claim_token);
+        if !matches {
+            return Err(CapivaraError::JobNotFound { id: id.to_string() });
+        }
         let Some(InFlight { job, .. }) = guard.in_flight.remove(&id.0) else {
             return Err(CapivaraError::JobNotFound { id: id.to_string() });
         };
