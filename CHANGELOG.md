@@ -9,20 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### M4 multi-broker path (in progress)
 
-Stabilize the shared `Broker` contract before an experimental RabbitMQ spike.
+Stabilize the shared `Broker` contract and land an **experimental** RabbitMQ spike.
 **Kafka is not planned.** Package remains **`0.0.1`** with **`publish = false`**.
 
 ### Added
+
+#### Experimental RabbitMQ broker spike (M4-2)
+
+- Opt-in Cargo feature **`rabbitmq`**: [`RabbitBroker`] / [`RabbitConfig`] via
+  [lapin](https://docs.rs/lapin) (default features stay free of lapin).
+- Implements `Broker`: enqueue (JSON publish), claim (`basic_get` + poll for
+  `block_for`), ack / nack / dead_letter with process-local claim-token → delivery
+  ownership, DLQ side queue `{prefix}{queue}:dead`, delayed nack via TTL+DLX hop on
+  `{prefix}{queue}:delayed`, best-effort `list_dead`.
+- **Honest gaps** (not Redis parity) documented in [`docs/BROKER.md`](docs/BROKER.md):
+  no timed lease/recover (`lease` ignored), process-local claim tokens and
+  `idempotency_key`, best-effort `list_dead`, no hot-path queue-depth metric.
+  Multi-process workers are broker-native (shared AMQP URL + prefix).
+- Integration tests `tests/rabbitmq_broker.rs` (testcontainers RabbitMQ image, or
+  `RABBITMQ_URL` / `AMQP_URL`); worker happy path with `MemoryResultBackend`.
 
 #### Broker capability matrix (M4-1)
 
 - [`docs/BROKER.md`](docs/BROKER.md): frozen capability matrix for **Memory** vs **Redis**
   (enqueue, claim+block, lease/recover, delayed nack, DLQ, `list_dead`, producer
-  `idempotency_key`, multi-process, queue-depth metric) plus **RabbitMQ spike**
-  placeholders and explicit **Kafka not planned**.
+  `idempotency_key`, multi-process, queue-depth metric) plus **RabbitMQ** experimental
+  row and explicit **Kafka not planned**.
 - `Broker` trait / module docs: multi-broker contract, settle rules, claim loop order
   (recover → promote delayed → claim); no API breaks.
-- README links to the matrix; “Not yet” notes experimental Rabbit next.
+- README links to the matrix; Rabbit called out as experimental with gaps.
 
 ### M3 observability suite (complete)
 
