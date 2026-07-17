@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
+use tracing::Instrument;
 
 /// Default claim lease (visibility timeout).
 pub const DEFAULT_LEASE: Duration = Duration::from_secs(30);
@@ -130,8 +131,25 @@ impl Worker {
                 }
             };
 
-            match self.broker.claim(&queues, self.lease, DEFAULT_BLOCK).await {
+            let claim_span = tracing::info_span!(
+                "capivara.claim",
+                job.id = tracing::field::Empty,
+                task.name = tracing::field::Empty,
+                queue = tracing::field::Empty,
+                attempt = tracing::field::Empty,
+            );
+            let claim_outcome =
+                async { self.broker.claim(&queues, self.lease, DEFAULT_BLOCK).await }
+                    .instrument(claim_span.clone())
+                    .await;
+
+            match claim_outcome {
                 Ok(Some(claimed)) => {
+                    claim_span.record("job.id", tracing::field::display(claimed.job.id));
+                    claim_span.record("task.name", claimed.job.task_name.as_str());
+                    claim_span.record("queue", claimed.job.queue.as_str());
+                    claim_span.record("attempt", claimed.job.attempts);
+
                     let broker = Arc::clone(&self.broker);
                     let results = self.results.clone();
                     let registry = Arc::clone(&self.registry);
@@ -177,12 +195,26 @@ impl Worker {
         broker: &Arc<dyn Broker>,
         id: &JobId,
         claim_token: &ClaimToken,
+        task_name: &str,
+        queue: &str,
+        attempt: u32,
     ) -> Result<()> {
-        match broker.ack(id, claim_token).await {
-            Ok(()) => Ok(()),
-            Err(CapivaraError::JobNotFound { .. }) => Ok(()),
-            Err(e) => Err(e),
+        let span = tracing::info_span!(
+            "capivara.ack",
+            job.id = %id,
+            task.name = task_name,
+            queue = queue,
+            attempt = attempt,
+        );
+        async {
+            match broker.ack(id, claim_token).await {
+                Ok(()) => Ok(()),
+                Err(CapivaraError::JobNotFound { .. }) => Ok(()),
+                Err(e) => Err(e),
+            }
         }
+        .instrument(span)
+        .await
     }
 
     /// Nack; treat lost ownership as non-fatal so the drain keeps going.
@@ -191,12 +223,26 @@ impl Worker {
         id: &JobId,
         claim_token: &ClaimToken,
         action: NackAction,
+        task_name: &str,
+        queue: &str,
+        attempt: u32,
     ) -> Result<()> {
-        match broker.nack(id, claim_token, action).await {
-            Ok(()) => Ok(()),
-            Err(CapivaraError::JobNotFound { .. }) => Ok(()),
-            Err(e) => Err(e),
+        let span = tracing::info_span!(
+            "capivara.nack",
+            job.id = %id,
+            task.name = task_name,
+            queue = queue,
+            attempt = attempt,
+        );
+        async {
+            match broker.nack(id, claim_token, action).await {
+                Ok(()) => Ok(()),
+                Err(CapivaraError::JobNotFound { .. }) => Ok(()),
+                Err(e) => Err(e),
+            }
         }
+        .instrument(span)
+        .await
     }
 
     /// Dead-letter this claim.
@@ -210,12 +256,26 @@ impl Worker {
         id: &JobId,
         claim_token: &ClaimToken,
         reason: &str,
+        task_name: &str,
+        queue: &str,
+        attempt: u32,
     ) -> Result<bool> {
-        match broker.dead_letter(id, claim_token, reason).await {
-            Ok(()) => Ok(true),
-            Err(CapivaraError::JobNotFound { .. }) => Ok(false),
-            Err(e) => Err(e),
+        let span = tracing::info_span!(
+            "capivara.dead_letter",
+            job.id = %id,
+            task.name = task_name,
+            queue = queue,
+            attempt = attempt,
+        );
+        async {
+            match broker.dead_letter(id, claim_token, reason).await {
+                Ok(()) => Ok(true),
+                Err(CapivaraError::JobNotFound { .. }) => Ok(false),
+                Err(e) => Err(e),
+            }
         }
+        .instrument(span)
+        .await
     }
 }
 
@@ -259,66 +319,33 @@ async fn process_one(
     let attempts = job.attempts;
     let job_id = job.id;
     let task_name = job.task_name.clone();
+    let queue = job.queue.as_str().to_string();
 
-    let handler = match registry.get(&job.task_name) {
-        Ok(h) => h,
-        Err(e) => {
-            let message = e.to_string();
-            // Unknown task is terminal — dead-letter first so Failure ≈ ownership.
-            let reason = format!("unknown task: {task_name}");
-            let owned = Worker::settle_dead_letter(&broker, &job_id, &claim_token, &reason).await?;
-            if owned {
-                if let Some(backend) = &results {
-                    backend
-                        .store(&job_id, JobResult::Failure { message })
-                        .await?;
-                }
-            }
-            return Ok(());
-        }
-    };
+    let handle_span = tracing::info_span!(
+        "capivara.handle",
+        job.id = %job_id,
+        task.name = task_name.as_str(),
+        queue = queue.as_str(),
+        attempt = attempts,
+    );
 
-    let payload = job.payload;
-
-    // Isolate panics: spawn catches unwind as JoinError.
-    let join = tokio::spawn(async move { handler(payload).await });
-
-    let outcome = match join.await {
-        Ok(Ok(bytes)) => JobResult::Success { payload: bytes },
-        Ok(Err(CapivaraError::TaskFailed { message })) => JobResult::Failure { message },
-        Ok(Err(e)) => JobResult::Failure {
-            message: e.to_string(),
-        },
-        Err(join_err) => JobResult::Failure {
-            message: format!("task panicked: {join_err}"),
-        },
-    };
-
-    match outcome {
-        JobResult::Success { payload } => {
-            if let Some(backend) = &results {
-                backend
-                    .store(&job_id, JobResult::Success { payload })
-                    .await?;
-            }
-            Worker::settle_ack(&broker, &job_id, &claim_token).await?;
-        }
-        JobResult::Failure { message } => {
-            if attempts < retry_policy.max_attempts {
-                // Intermediate retry: do **not** store Failure.
-                let delay = retry_policy.delay_for_attempt(attempts);
-                Worker::settle_nack(
+    async {
+        let handler = match registry.get(&task_name) {
+            Ok(h) => h,
+            Err(e) => {
+                let message = e.to_string();
+                // Unknown task is terminal — dead-letter first so Failure ≈ ownership.
+                let reason = format!("unknown task: {task_name}");
+                let owned = Worker::settle_dead_letter(
                     &broker,
                     &job_id,
                     &claim_token,
-                    NackAction::RequeueAfter { delay },
+                    &reason,
+                    &task_name,
+                    &queue,
+                    attempts,
                 )
                 .await?;
-            } else {
-                // Terminal: dead_letter first; store Failure only if we still own
-                // the claim (avoids Failure while another claim may still run).
-                let owned =
-                    Worker::settle_dead_letter(&broker, &job_id, &claim_token, &message).await?;
                 if owned {
                     if let Some(backend) = &results {
                         backend
@@ -326,9 +353,76 @@ async fn process_one(
                             .await?;
                     }
                 }
+                return Ok(());
+            }
+        };
+
+        let payload = job.payload;
+
+        // Isolate panics: spawn catches unwind as JoinError.
+        let join = tokio::spawn(async move { handler(payload).await });
+
+        let outcome = match join.await {
+            Ok(Ok(bytes)) => JobResult::Success { payload: bytes },
+            Ok(Err(CapivaraError::TaskFailed { message })) => JobResult::Failure { message },
+            Ok(Err(e)) => JobResult::Failure {
+                message: e.to_string(),
+            },
+            Err(join_err) => JobResult::Failure {
+                message: format!("task panicked: {join_err}"),
+            },
+        };
+
+        match outcome {
+            JobResult::Success { payload } => {
+                if let Some(backend) = &results {
+                    backend
+                        .store(&job_id, JobResult::Success { payload })
+                        .await?;
+                }
+                Worker::settle_ack(&broker, &job_id, &claim_token, &task_name, &queue, attempts)
+                    .await?;
+            }
+            JobResult::Failure { message } => {
+                if attempts < retry_policy.max_attempts {
+                    // Intermediate retry: do **not** store Failure.
+                    let delay = retry_policy.delay_for_attempt(attempts);
+                    Worker::settle_nack(
+                        &broker,
+                        &job_id,
+                        &claim_token,
+                        NackAction::RequeueAfter { delay },
+                        &task_name,
+                        &queue,
+                        attempts,
+                    )
+                    .await?;
+                } else {
+                    // Terminal: dead_letter first; store Failure only if we still own
+                    // the claim (avoids Failure while another claim may still run).
+                    let owned = Worker::settle_dead_letter(
+                        &broker,
+                        &job_id,
+                        &claim_token,
+                        &message,
+                        &task_name,
+                        &queue,
+                        attempts,
+                    )
+                    .await?;
+                    if owned {
+                        if let Some(backend) = &results {
+                            backend
+                                .store(&job_id, JobResult::Failure { message })
+                                .await?;
+                        }
+                    }
+                }
             }
         }
-    }
 
-    Ok(())
+        Ok(())
+    }
+    .instrument(handle_span)
+    .await
 }

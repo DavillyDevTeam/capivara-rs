@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Tracing spans (M3-1)
+
+- Always-on [`tracing`](https://docs.rs/tracing) dependency (facade only; no subscriber forced).
+- Spans on core paths: `capivara.enqueue`, `capivara.claim`, `capivara.handle`,
+  `capivara.ack`, `capivara.nack`, `capivara.dead_letter`, `capivara.get_result`.
+- Fields when available: `job.id`, `task.name`, `queue`, `attempt` (no payloads/secrets).
+- Instrumented at App/Worker orchestration so Memory and Redis share the same coverage.
+- README **Observability** section: install a subscriber + `RUST_LOG` example.
+
 ### M2 reliability suite (complete)
 
 End-to-end reliability for the library shape: shared **RetryPolicy**, per-queue **DLQ**,

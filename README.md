@@ -13,9 +13,9 @@ a universal CLI that runs arbitrary remote code.
 | **Package** | `capivara` (repo: [`capivara-rs`](https://github.com/DavillyDevTeam/capivara-rs)) |
 | **Org** | [DavillyDevTeam](https://github.com/DavillyDevTeam) |
 | **License** | MIT OR Apache-2.0 |
-| **Status** | **M2 complete** (RetryPolicy, DLQ, terminal Failure, producer idempotency, guarantees docs); M1 Memory + Redis + concurrency |
+| **Status** | **M3-1** tracing spans on core paths; M2 reliability complete; M1 Memory + Redis + concurrency |
 
-## What works today (M0–M2)
+## What works today (M0–M3)
 
 - Typed **`Task`** trait (`NAME`, `Args`, `Output`, native async `run`)
 - **`App`**: `register` / `send` / `send_with_idempotency_key` / `run_worker` / `get_result`
@@ -34,6 +34,8 @@ a universal CLI that runs arbitrary remote code.
 - Worker concurrency: Tokio tasks limited by a semaphore (default **4**)
 - Claim-scoped ownership: each claim issues a `ClaimToken` required by `ack`/`nack`/`dead_letter`
 - Panic isolation at the task boundary (worker keeps going)
+- **`tracing`** spans on core paths (`capivara.enqueue`, `claim`, `handle`, `ack`, `nack`,
+  `dead_letter`, `get_result`) — library emits only; apps install a subscriber
 - CI: fmt, clippy, tests (least-privilege permissions + concurrency)
 - Dependabot for Cargo / Actions; secret scanning enabled on the repo
 
@@ -177,12 +179,44 @@ app.register::<MyTask>().await?;
 app.run_worker(None).await?;
 ```
 
+## Observability
+
+Capivara depends on the [`tracing`](https://docs.rs/tracing) facade and emits **spans**
+on the main job lifecycle paths. It does **not** install a global subscriber — your
+application (or binary) chooses the exporter.
+
+| Span name | Where |
+|---|---|
+| `capivara.enqueue` | `App::send` / `send_with_idempotency_key` |
+| `capivara.claim` | Worker claim loop |
+| `capivara.handle` | Task handler execution |
+| `capivara.ack` | Successful settle |
+| `capivara.nack` | Retry requeue settle |
+| `capivara.dead_letter` | Terminal DLQ settle |
+| `capivara.get_result` | `App::get_result` |
+
+Common fields (when available): `job.id`, `task.name`, `queue`, `attempt`.
+Payloads and secrets (e.g. Redis URL passwords) are **never** logged.
+
+Minimal app-side setup with the usual env filter:
+
+```rust
+// In your binary / main (not required by the library):
+// tracing_subscriber = { version = "0.3", features = ["env-filter"] }
+tracing_subscriber::fmt()
+    .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+    .init();
+// RUST_LOG=capivara=info,info cargo run
+```
+
+Prometheus metrics are planned for a later M3 slice — not in this release.
+
 ## Not yet
 
 - DLQ replay / redrive API
 - Proc-macro or `app.task("name", fn)` sugar
 - crates.io publish (`publish = false` until then)
-- Metrics / full tracing suite (M3+)
+- Prometheus / metrics export (M3-2)
 
 ## Quick example
 
