@@ -1,8 +1,10 @@
 //! Prometheus-ready metrics via the [`metrics`] facade.
 //!
-//! Capivara emits counters, histograms, and best-effort gauges. It does **not**
-//! install a global recorder or HTTP scrape endpoint (see M3-3). Applications
-//! choose an exporter (e.g. `metrics-exporter-prometheus`).
+//! Capivara emits counters, histograms, and best-effort gauges. The core library
+//! does **not** install a global recorder. Applications may wire an exporter
+//! themselves (e.g. `metrics-exporter-prometheus`), or enable the
+//! **`metrics-http`** feature and call [`crate::metrics_http::serve`] for a
+//! loopback Prometheus scrape endpoint.
 //!
 //! # Metric names
 //!

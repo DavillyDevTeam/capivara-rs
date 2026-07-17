@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Prometheus scrape endpoint (M3-3)
+
+- Optional Cargo feature **`metrics-http`**: installs a Prometheus recorder and serves
+  a scrape HTTP endpoint via [`metrics-exporter-prometheus`](https://docs.rs/metrics-exporter-prometheus)
+  (HTTP listener only; no push-gateway).
+- Public API: [`capivara::metrics_http::serve`] / `start_metrics_server(SocketAddr) -> JoinHandle<()>`
+  (requires a Tokio runtime). Default bind **`127.0.0.1:9090`**.
+- Documents **no auth** in v0, loopback default, and **one global recorder** per process.
+- Integration test `tests/metrics_http.rs` (ephemeral loopback port) behind the feature.
+- Default builds do **not** pull hyper / the exporter.
+
 #### Metrics via `metrics` facade (M3-2)
 
 - Always-on [`metrics`](https://docs.rs/metrics) dependency (facade only; no recorder/HTTP forced).
@@ -21,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     **Redis does not LLEN** on the hot path
 - Wired at `App` enqueue and Worker claim/completion paths (`src/metrics.rs` helpers).
 - Unit + integration tests with `metrics-util` `DebuggingRecorder`.
-- README **Observability → Metrics** note; scrape endpoint deferred to M3-3.
+- README **Observability → Metrics** note.
 
 #### Tracing spans (M3-1)
 

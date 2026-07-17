@@ -13,7 +13,7 @@ a universal CLI that runs arbitrary remote code.
 | **Package** | `capivara` (repo: [`capivara-rs`](https://github.com/DavillyDevTeam/capivara-rs)) |
 | **Org** | [DavillyDevTeam](https://github.com/DavillyDevTeam) |
 | **License** | MIT OR Apache-2.0 |
-| **Status** | **M3-2** metrics facade + M3-1 tracing; M2 reliability complete; M1 Memory + Redis + concurrency |
+| **Status** | **M3-3** optional metrics scrape + M3-2 facade + M3-1 tracing; M2 reliability; M1 Memory + Redis |
 
 ## What works today (M0–M3)
 
@@ -36,8 +36,8 @@ a universal CLI that runs arbitrary remote code.
 - Panic isolation at the task boundary (worker keeps going)
 - **`tracing`** spans on core paths (`capivara.enqueue`, `claim`, `handle`, `ack`, `nack`,
   `dead_letter`, `get_result`) — library emits only; apps install a subscriber
-- **`metrics`** facade counters/histograms (Prometheus-ready names; no scrape server yet) —
-  library emits only; apps install a recorder/exporter
+- **`metrics`** facade counters/histograms (Prometheus-ready names); optional
+  **`metrics-http`** scrape server (`GET /metrics` on `127.0.0.1:9090` by default)
 - CI: fmt, clippy, tests (least-privilege permissions + concurrency)
 - Dependabot for Cargo / Actions; secret scanning enabled on the repo
 
@@ -51,9 +51,12 @@ and [docs/guarantees.md](docs/guarantees.md).
 |---|---|---|
 | *(none)* | yes | `MemoryBroker` / `MemoryResultBackend` |
 | `redis` | **opt-in** | `RedisBroker` + `RedisResultBackend` (multi-process capable) |
+| `metrics-http` | **opt-in** | Prometheus scrape HTTP server (`capivara::metrics_http`) |
 
 ```toml
 capivara = { version = "0.0.1", features = ["redis"] }
+# optional scrape endpoint (pulls metrics-exporter-prometheus + hyper):
+# capivara = { version = "0.0.1", features = ["metrics-http"] }
 ```
 
 Redis integration tests (`cargo test --features redis`) use **testcontainers** when
@@ -221,9 +224,9 @@ tracing_subscriber::fmt()
 ### Metrics
 
 Capivara depends on the [`metrics`](https://docs.rs/metrics) facade and emits
-Prometheus-friendly counters/histograms/gauges. It does **not** install a global
-recorder or HTTP scrape endpoint (scrape server is a later M3 slice). Wire an
-exporter in your binary (e.g. `metrics-exporter-prometheus`).
+Prometheus-friendly counters/histograms/gauges. The core library does **not**
+install a global recorder. Either wire an exporter in your binary, or enable the
+**`metrics-http`** feature for a built-in scrape server.
 
 | Metric | Type | Labels |
 |---|---|---|
@@ -244,12 +247,33 @@ as costly under load). Sample depth out-of-band if you need it for Redis.
 
 Constants and helpers live in [`capivara::metrics`](src/metrics.rs).
 
+#### Optional scrape endpoint (`metrics-http`)
+
+```toml
+capivara = { version = "0.0.1", features = ["metrics-http"] }
+```
+
+```rust
+// In your binary (requires a Tokio runtime):
+// let _metrics = capivara::metrics_http::serve()?; // 127.0.0.1:9090
+// let _metrics = capivara::metrics_http::start_metrics_server("127.0.0.1:9100".parse()?)?;
+```
+
+- Installs the **global** Prometheus recorder (only one global recorder per process).
+- Serves Prometheus text exposition (scrape `GET /metrics`; exporter accepts any path).
+- Default bind: **`127.0.0.1:9090`** ([`metrics_http::DEFAULT_BIND`](src/metrics_http.rs)).
+- **v0 security:** no authentication. Keep the bind on loopback or isolate the
+  scrape network; put TLS/auth at a reverse proxy if you expose it.
+
+```bash
+cargo test --features metrics-http
+```
+
 ## Not yet
 
 - DLQ replay / redrive API
 - Proc-macro or `app.task("name", fn)` sugar
 - crates.io publish (`publish = false` until then)
-- HTTP `/metrics` scrape endpoint (M3-3)
 
 ## Quick example
 

@@ -13,6 +13,7 @@
 //!
 //! - *(default)* Memory broker/results for in-process tests.
 //! - `redis` — [`RedisBroker`] + [`RedisResultBackend`] (multi-process capable).
+//! - `metrics-http` — optional Prometheus scrape server (`GET /metrics`; see [`metrics_http`]).
 //!
 //! # Example
 //!
@@ -66,6 +67,8 @@ mod broker;
 mod error;
 mod job;
 pub mod metrics;
+#[cfg(feature = "metrics-http")]
+pub mod metrics_http;
 mod registry;
 mod result;
 mod retry;

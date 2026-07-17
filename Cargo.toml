@@ -16,6 +16,9 @@ authors = ["Duarte Mainart Tecnologia e Publicidade LTDA"]
 default = []
 # Opt-in Redis broker + Redis result backend. Memory backends need no feature.
 redis = ["dep:redis"]
+# Opt-in Prometheus scrape HTTP server (`GET /metrics` on 127.0.0.1:9090 by default).
+# Pulls `metrics-exporter-prometheus` + hyper; not enabled by default.
+metrics-http = ["dep:metrics-exporter-prometheus"]
 
 [dependencies]
 async-trait = "0.1.89"
@@ -28,6 +31,8 @@ uuid = { version = "1.23.4", features = ["v4", "serde"] }
 redis = { version = "0.27", optional = true, default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
 rand = "0.8"
 metrics = "0.24"
+# HTTP scrape only (no push-gateway / rustls). Used solely by `metrics-http`.
+metrics-exporter-prometheus = { version = "0.18", optional = true, default-features = false, features = ["http-listener"] }
 
 [lib]
 name = "capivara"
@@ -45,3 +50,8 @@ metrics-util = { version = "0.20", default-features = false, features = ["debugg
 name = "redis_broker"
 path = "tests/redis_broker.rs"
 required-features = ["redis"]
+
+[[test]]
+name = "metrics_http"
+path = "tests/metrics_http.rs"
+required-features = ["metrics-http"]
