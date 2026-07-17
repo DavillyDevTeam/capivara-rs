@@ -30,11 +30,19 @@ pub enum CapivaraError {
     #[error("broker error: {0}")]
     Broker(String),
 
+    /// Redis (or other) result-backend I/O failure — distinct from queue broker errors.
+    #[error("result backend error: {message}")]
+    ResultBackend { message: String },
+
     #[error("task failed: {message}")]
     TaskFailed { message: String },
 
     #[error("task panicked: {message}")]
     TaskPanicked { message: String },
+
+    /// Invariant violation or unexpected internal state (e.g. concurrency bookkeeping).
+    #[error("internal error: {message}")]
+    Internal { message: String },
 }
 
 /// Convenience alias for library results.

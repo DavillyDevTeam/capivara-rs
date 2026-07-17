@@ -4,8 +4,8 @@
 //! testcontainers (needs a working Docker socket — standard on GHA).
 
 use capivara::{
-    App, Broker, CapivaraError, Job, JobResult, MemoryResultBackend, NackAction, QueueName,
-    RedisBroker, RedisConfig, Task, TaskError,
+    App, Broker, CapivaraError, DEFAULT_RESULT_TTL, Job, JobResult, MemoryResultBackend,
+    NackAction, QueueName, RedisBroker, RedisConfig, RedisResultBackend, Task, TaskError,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -120,6 +120,113 @@ async fn redis_app_roundtrip_with_memory_results() {
             assert_eq!(out.echo, "hello");
         }
         JobResult::Failure { message } => panic!("{message}"),
+    }
+}
+
+#[tokio::test]
+async fn redis_app_roundtrip_with_redis_results() {
+    let (_guard, url) = redis_url().await;
+    let prefix = "capivara_redis_results:";
+    let config = RedisConfig::new(url).with_prefix(prefix);
+    let broker = RedisBroker::connect(config.clone()).await.unwrap();
+    let results = RedisResultBackend::connect(config).await.unwrap();
+    let app = App::new(broker).with_result_backend(results);
+    app.register::<Ping>().await.unwrap();
+
+    let id = app
+        .send::<Ping>(&PingArgs {
+            msg: "redis-result".into(),
+        })
+        .await
+        .unwrap();
+    let n = app.run_worker(None).await.unwrap();
+    assert_eq!(n, 1);
+
+    match app.get_result(id).await.unwrap() {
+        JobResult::Success { payload } => {
+            let out: PingResult = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(out.echo, "redis-result");
+        }
+        JobResult::Failure { message } => panic!("{message}"),
+    }
+}
+
+#[tokio::test]
+async fn redis_result_key_has_24h_ttl() {
+    let (_guard, url) = redis_url().await;
+    let prefix = "capivara_redis_ttl:";
+    let config = RedisConfig::new(url.clone()).with_prefix(prefix);
+    let broker = RedisBroker::connect(config.clone()).await.unwrap();
+    let results = RedisResultBackend::connect(config).await.unwrap();
+    let app = App::new(broker).with_result_backend(results);
+    app.register::<Ping>().await.unwrap();
+
+    let id = app
+        .send::<Ping>(&PingArgs {
+            msg: "ttl-check".into(),
+        })
+        .await
+        .unwrap();
+    app.run_worker(None).await.unwrap();
+    // Confirm result is readable through the backend.
+    assert!(matches!(
+        app.get_result(id).await.unwrap(),
+        JobResult::Success { .. }
+    ));
+
+    // Direct Redis TTL on the result key (default EX 86400).
+    let client = redis::Client::open(url.as_str()).expect("redis client");
+    let mut conn = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("redis conn");
+    // Key layout is part of the public contract: `{prefix}result:{id}`.
+    let key = format!("{prefix}result:{id}");
+    let ttl: i64 = redis::cmd("TTL")
+        .arg(&key)
+        .query_async(&mut conn)
+        .await
+        .expect("TTL");
+    let default_secs = DEFAULT_RESULT_TTL.as_secs() as i64;
+    assert!(
+        ttl > default_secs - 60 && ttl <= default_secs,
+        "expected TTL near {default_secs}s, got {ttl} (key={key})"
+    );
+}
+
+#[tokio::test]
+async fn redis_concurrency_smoke() {
+    let (_guard, url) = redis_url().await;
+    let prefix = "capivara_redis_conc:";
+    let config = RedisConfig::new(url).with_prefix(prefix);
+    let broker = RedisBroker::connect(config.clone()).await.unwrap();
+    let results = RedisResultBackend::connect(config).await.unwrap();
+    let app = App::new(broker)
+        .with_result_backend(results)
+        .with_concurrency(4);
+    app.register::<Ping>().await.unwrap();
+
+    let mut ids = Vec::new();
+    for i in 0..8 {
+        let id = app
+            .send::<Ping>(&PingArgs {
+                msg: format!("c{i}"),
+            })
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+
+    let n = app.run_worker(None).await.unwrap();
+    assert_eq!(n, 8);
+
+    for (i, id) in ids.into_iter().enumerate() {
+        match app.get_result(id).await.unwrap() {
+            JobResult::Success { payload } => {
+                let out: PingResult = serde_json::from_slice(&payload).unwrap();
+                assert_eq!(out.echo, format!("c{i}"));
+            }
+            JobResult::Failure { message } => panic!("job {i}: {message}"),
+        }
     }
 }
 

@@ -8,7 +8,9 @@ use crate::job::{Job, JobId, QueueName};
 use crate::registry::Registry;
 use crate::result::{JobResult, ResultBackend};
 use crate::task::Task;
-use crate::worker::{DEFAULT_LEASE, DEFAULT_MAX_ATTEMPTS, DEFAULT_NACK_DELAY, Worker};
+use crate::worker::{
+    DEFAULT_CONCURRENCY, DEFAULT_LEASE, DEFAULT_MAX_ATTEMPTS, DEFAULT_NACK_DELAY, Worker,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -22,6 +24,7 @@ pub struct App {
     lease: Duration,
     max_attempts: u32,
     nack_delay: Duration,
+    concurrency: usize,
 }
 
 impl App {
@@ -35,6 +38,7 @@ impl App {
             lease: DEFAULT_LEASE,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             nack_delay: DEFAULT_NACK_DELAY,
+            concurrency: DEFAULT_CONCURRENCY,
         }
     }
 
@@ -66,6 +70,14 @@ impl App {
     /// Delay before requeue after a retryable failure (default 5s).
     pub fn with_nack_delay(mut self, nack_delay: Duration) -> Self {
         self.nack_delay = nack_delay;
+        self
+    }
+
+    /// Max concurrent in-flight jobs in [`Self::run_worker`] (default 4).
+    ///
+    /// Values below 1 are clamped to 1.
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = concurrency.max(1);
         self
     }
 
@@ -114,8 +126,9 @@ impl App {
 
     /// Process pending jobs in-process until the queue is empty (or `max_jobs`).
     ///
-    /// Uses configured lease / max_attempts / nack_delay. Delayed nacks are not
-    /// waited on in a single drain pass — call again after the delay for retries.
+    /// Uses configured lease / max_attempts / nack_delay / concurrency. Delayed
+    /// nacks are not waited on in a single drain pass — call again after the
+    /// delay for retries.
     pub async fn run_worker(&self, max_jobs: Option<usize>) -> Result<usize> {
         let registry = {
             let guard = self.registry.lock().await;
@@ -130,6 +143,7 @@ impl App {
             lease: self.lease,
             max_attempts: self.max_attempts,
             nack_delay: self.nack_delay,
+            concurrency: self.concurrency,
         };
         worker.run(max_jobs).await
     }

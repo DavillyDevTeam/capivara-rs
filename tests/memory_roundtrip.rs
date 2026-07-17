@@ -7,6 +7,8 @@ use capivara::{
     QueueName, Task, TaskError,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct AddArgs {
@@ -76,6 +78,84 @@ async fn success_roundtrip_with_results() {
         }
         JobResult::Failure { message } => panic!("unexpected failure: {message}"),
     }
+}
+
+/// Tracks in-flight PeakProbe handlers for concurrency bounds assertions.
+static PEAK_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static PEAK_MAX: AtomicUsize = AtomicUsize::new(0);
+
+struct PeakProbe;
+
+impl Task for PeakProbe {
+    const NAME: &'static str = "peak_probe";
+    type Args = Empty;
+    type Output = Empty;
+
+    async fn run(_args: Self::Args) -> Result<Self::Output, TaskError> {
+        let n = PEAK_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+        PEAK_MAX.fetch_max(n, Ordering::SeqCst);
+        // Hold the slot long enough for other concurrent claims to overlap.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        PEAK_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        Ok(Empty)
+    }
+}
+
+#[tokio::test]
+async fn concurrency_processes_several_jobs() {
+    let app = App::new(MemoryBroker::new())
+        .with_result_backend(MemoryResultBackend::new())
+        .with_concurrency(4);
+    app.register::<Add>().await.unwrap();
+
+    let mut ids = Vec::new();
+    for i in 0..8 {
+        ids.push(app.send::<Add>(&AddArgs { x: i, y: i * 10 }).await.unwrap());
+    }
+
+    let n = app.run_worker(None).await.unwrap();
+    assert_eq!(n, 8);
+
+    for (i, id) in ids.into_iter().enumerate() {
+        match app.get_result(id).await.unwrap() {
+            JobResult::Success { payload } => {
+                let out: AddResult = serde_json::from_slice(&payload).unwrap();
+                let i = i as i32;
+                assert_eq!(out.sum, i + i * 10);
+            }
+            JobResult::Failure { message } => panic!("job {i}: {message}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn concurrency_bounds_in_flight_handlers() {
+    // Reset peak counters (tests may run in parallel across processes, not threads).
+    PEAK_IN_FLIGHT.store(0, Ordering::SeqCst);
+    PEAK_MAX.store(0, Ordering::SeqCst);
+
+    const LIMIT: usize = 4;
+    let app = App::new(MemoryBroker::new())
+        .with_result_backend(MemoryResultBackend::new())
+        .with_concurrency(LIMIT);
+    app.register::<PeakProbe>().await.unwrap();
+
+    for _ in 0..8 {
+        app.send::<PeakProbe>(&Empty).await.unwrap();
+    }
+
+    let n = app.run_worker(None).await.unwrap();
+    assert_eq!(n, 8);
+
+    let peak = PEAK_MAX.load(Ordering::SeqCst);
+    assert!(
+        peak <= LIMIT,
+        "peak in-flight handlers {peak} exceeded concurrency {LIMIT}"
+    );
+    assert!(
+        peak >= 2,
+        "expected overlapping work under concurrency (peak was {peak})"
+    );
 }
 
 #[tokio::test]

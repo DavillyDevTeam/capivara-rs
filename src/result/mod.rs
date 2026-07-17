@@ -4,8 +4,12 @@
 //! uses `JobId` + `get_result` (not a fake blocking `AsyncResult` without config).
 
 mod memory;
+#[cfg(feature = "redis")]
+mod redis_result;
 
 pub use memory::MemoryResultBackend;
+#[cfg(feature = "redis")]
+pub use redis_result::{DEFAULT_RESULT_TTL, RedisResultBackend};
 
 use crate::error::Result;
 use crate::job::JobId;

@@ -13,7 +13,7 @@ a universal CLI that runs arbitrary remote code.
 | **Package** | `capivara` (repo: [`capivara-rs`](https://github.com/DavillyDevTeam/capivara-rs)) |
 | **Org** | [DavillyDevTeam](https://github.com/DavillyDevTeam) |
 | **License** | MIT OR Apache-2.0 |
-| **Status** | M1 in progress: Memory + optional Redis broker |
+| **Status** | M1: Memory + optional Redis broker/results + worker concurrency |
 
 ## What works today (M0 / M1)
 
@@ -22,12 +22,14 @@ a universal CLI that runs arbitrary remote code.
   - optional `with_result_backend`, `with_default_queue`
   - `broker()` for shared broker access / advanced raw `Job` enqueue
   - worker policy: `with_lease` (default **30s**), `with_max_attempts` (default **3**),
-    `with_nack_delay` (default **5s**)
+    `with_nack_delay` (default **5s**), `with_concurrency` (default **4**)
 - **`MemoryBroker`** + optional **`MemoryResultBackend`**
   - **Single-process only** — not shared across OS processes; not a distributed queue
-- Optional **`RedisBroker`** (`redis` feature): LIST + lease, Lua claim/ack/nack,
-  delayed requeue, **lease recover-on-claim**, **claim tokens** (late ack/nack
-  cannot steal a newer claim after recover)
+- Optional **`RedisBroker`** + **`RedisResultBackend`** (`redis` feature)
+  - LIST + lease, Lua claim/ack/nack, delayed requeue
+  - **lease recover-on-claim**, **claim tokens** (late ack/nack cannot steal a newer claim)
+  - results as `{prefix}result:{id}` STRING JSON with **24h TTL**
+- Worker concurrency: Tokio tasks limited by a semaphore (default **4**)
 - Worker retry policy: task `Err` / panic → store Failure →
   `nack(RequeueAfter)` until `max_attempts`, then terminal `ack`
   (unknown task name is always terminal; lost-lease settle is non-fatal)
@@ -43,7 +45,7 @@ a universal CLI that runs arbitrary remote code.
 | Feature | Default | What it enables |
 |---|---|---|
 | *(none)* | yes | `MemoryBroker` / `MemoryResultBackend` |
-| `redis` | **opt-in** | `RedisBroker` (LIST + lease; multi-process capable) |
+| `redis` | **opt-in** | `RedisBroker` + `RedisResultBackend` (multi-process capable) |
 
 ```toml
 capivara = { version = "0.0.1", features = ["redis"] }
@@ -57,11 +59,39 @@ docker run -d --rm -p 6379:6379 docker.io/library/redis:7-alpine
 REDIS_URL=redis://127.0.0.1:6379/ cargo test --features redis
 ```
 
+## Multi-process (Redis)
+
+Producer and worker are separate OS processes that share Redis:
+
+1. Both connect with the **same** `RedisConfig` (`url` + `prefix`).
+2. Producer: `RedisBroker` (+ optional `RedisResultBackend` if it will call `get_result`).
+3. Worker: same `RedisBroker` + same `RedisResultBackend`, `register` the same task types, then `run_worker` (or a long-running loop around it).
+4. At-least-once delivery: a crashed worker’s claim expires (default lease **30s**); **recover-on-claim** requeues the job. Tasks should be **idempotent**. Failures retry with `nack` delay (default **5s**) up to `max_attempts` (default **3**); panics count as failures.
+
+```rust
+// Producer process
+use capivara::{App, RedisBroker, RedisConfig, RedisResultBackend, Task, /* ... */};
+
+let config = RedisConfig::new("redis://127.0.0.1/").with_prefix("myapp:");
+let broker = RedisBroker::connect(config.clone()).await?;
+let results = RedisResultBackend::connect(config).await?;
+let app = App::new(broker).with_result_backend(results);
+// register, send, get_result ...
+```
+
+```rust
+// Worker process — same url, prefix, and Task impls
+let app = App::new(broker)
+    .with_result_backend(results)
+    .with_concurrency(4); // default; clamp ≥ 1
+app.register::<MyTask>().await?;
+app.run_worker(None).await?;
+```
+
 ## Not yet
 
-- `RedisResultBackend` & worker concurrency N (M1 PR-C)  
-- DLQ / exponential backoff (M2)  
-- Proc-macro or `app.task("name", fn)` sugar  
+- DLQ / exponential backoff (M2)
+- Proc-macro or `app.task("name", fn)` sugar
 - crates.io publish (`publish = false` until then)
 
 ## Quick example

@@ -14,7 +14,7 @@ authors = ["Duarte Mainart Tecnologia e Publicidade LTDA"]
 
 [features]
 default = []
-# Opt-in Redis broker (and later Redis results in PR-C). Memory backends need no feature.
+# Opt-in Redis broker + Redis result backend. Memory backends need no feature.
 redis = ["dep:redis"]
 
 [dependencies]
@@ -34,6 +34,8 @@ path = "src/lib.rs"
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "time"] }
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["redis"] }
+# For Redis TTL assertions in integration tests (same feature set as optional dep).
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
 
 [[test]]
 name = "redis_broker"

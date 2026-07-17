@@ -12,7 +12,7 @@
 //! # Features
 //!
 //! - *(default)* Memory broker/results for in-process tests.
-//! - `redis` — [`RedisBroker`] multi-process Redis LIST + lease broker.
+//! - `redis` — [`RedisBroker`] + [`RedisResultBackend`] (multi-process capable).
 //!
 //! # Example
 //!
@@ -76,5 +76,7 @@ pub use broker::{Broker, ClaimToken, ClaimedJob, MemoryBroker, NackAction};
 pub use broker::{RedisBroker, RedisConfig};
 pub use error::{CapivaraError, Result, TaskError};
 pub use job::{Job, JobId, QueueName};
+#[cfg(feature = "redis")]
+pub use result::{DEFAULT_RESULT_TTL, RedisResultBackend};
 pub use result::{JobResult, MemoryResultBackend, ResultBackend};
 pub use task::Task;
