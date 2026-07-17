@@ -1,10 +1,11 @@
 # Delivery guarantees & architecture notes
 
-This document records **what capivara promises today** (M0–M3) and the design
-decisions behind those promises. For a shorter operator-facing summary, see the
-README sections [Failure modes in 10 minutes](../README.md#failure-modes-in-10-minutes)
+This document records **what capivara promises today** (M0–M3; M4 multi-broker path)
+and the design decisions behind those promises. For a shorter operator-facing summary,
+see the README sections [Failure modes in 10 minutes](../README.md#failure-modes-in-10-minutes)
 and [Delivery guarantees & failure modes](../README.md#delivery-guarantees--failure-modes).
-Structural map: [ARCHITECTURE.md](ARCHITECTURE.md).
+Structural map: [ARCHITECTURE.md](ARCHITECTURE.md). Broker capability matrix (Memory /
+Redis / Rabbit next): [BROKER.md](BROKER.md).
 
 APIs referenced: `App`, `Broker`, `RetryPolicy`, `JobResult`, `DeadLetter`,
 `ClaimToken`, `send_with_idempotency_key`.
