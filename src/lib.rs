@@ -75,6 +75,7 @@ mod registry;
 mod result;
 mod retry;
 mod task;
+mod task_sync;
 mod worker;
 
 pub use app::App;
@@ -90,3 +91,4 @@ pub use result::{DEFAULT_RESULT_TTL, RedisResultBackend};
 pub use result::{JobResult, MemoryResultBackend, ResultBackend};
 pub use retry::{DEFAULT_BASE_DELAY, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_DELAY, RetryPolicy};
 pub use task::Task;
+pub use task_sync::{SyncTask, run_blocking};

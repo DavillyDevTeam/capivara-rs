@@ -65,9 +65,12 @@ Omit a result backend for **fire-and-forget**. Delivery is **at-least-once** —
 `list_dead`, producer idempotency — Memory vs Redis vs experimental Rabbit; Kafka not planned):
 [docs/BROKER.md](docs/BROKER.md).
 
-## What works today (M0–M3)
+## What works today (M0–M4 partial)
 
 - Typed **`Task`** trait (`NAME`, `Args`, `Output`, native async `run`)
+- **Sync / blocking handlers** — [`SyncTask`](src/task_sync.rs) (blanket `Task` via
+  `spawn_blocking`) and [`run_blocking`](src/task_sync.rs) for hybrid async bodies;
+  see [Blocking / sync tasks](#blocking--sync-tasks) and `examples/sync_task.rs`
 - **`App`**: `register` / `send` / `send_with_idempotency_key` / `run_worker` / `get_result`
   - optional `with_result_backend`, `with_default_queue`
   - `broker()` for shared broker access / advanced raw `Job` enqueue
@@ -382,6 +385,51 @@ cargo test --features metrics-http
 - Proc-macro or `app.task("name", fn)` sugar
 - crates.io publish — stay at **`0.0.1`** / **`publish = false`** until the maintainer
   agrees a **`0.1.0`** release (discuss after M3; do not publish unilaterally)
+
+## Blocking / sync tasks
+
+Workers run on Tokio. **Do not** call `std::thread::sleep`, blocking `std::fs`, or
+heavy CPU loops directly inside `async fn Task::run` — that stalls the runtime and
+hurts concurrency.
+
+Two DX helpers (no proc-macro):
+
+| Helper | When to use |
+|---|---|
+| **`SyncTask`** | Entire handler is sync/blocking. Implement `fn run(...) -> Result<...>` (no `async`). A blanket `Task` impl runs it with `tokio::task::spawn_blocking`. `register::<T>()` / `send::<T>()` work unchanged. |
+| **`run_blocking(f, args).await`** | Hand-written async `Task::run` that only needs a blocking section (or a one-off closure). |
+
+```rust
+use capivara::{SyncTask, TaskError};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct WorkArgs { n: u64 }
+
+#[derive(Serialize, Deserialize)]
+struct WorkOut { sum: u64 }
+
+struct BlockingWork;
+
+impl SyncTask for BlockingWork {
+    const NAME: &'static str = "blocking_work";
+    type Args = WorkArgs;
+    type Output = WorkOut;
+
+    fn run(args: Self::Args) -> Result<Self::Output, TaskError> {
+        // Runs on the blocking pool — sleep / CPU / sync I/O are OK.
+        let sum: u64 = (0..args.n).sum();
+        Ok(WorkOut { sum })
+    }
+}
+// app.register::<BlockingWork>().await?;
+// app.send::<BlockingWork>(&WorkArgs { n: 100 }).await?;
+```
+
+Full runnable sample: `cargo run --example sync_task`.
+
+**Note:** both `Task` and `SyncTask` expose `run`. To call the sync body directly,
+use UFCS: `<T as SyncTask>::run(args)`. Prefer `register` / `send` for normal use.
 
 ## Quick example
 
