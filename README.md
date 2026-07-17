@@ -77,6 +77,11 @@ execution and **idempotent** task handlers. Deeper rationale lives in
    the same job (new token, `attempts` incremented).
 4. **Implication:** side effects in `Task::run` may run more than once. Handlers
    should be idempotent (or safe under duplicate work).
+5. Crash **after** storing `Success` and **before** `ack` can also redeliver: the
+   result backend may be **rewritten** (another Success, or even terminal Failure).
+   Visible Success is not a durable “done” bit until the claim is settled with no
+   further redelivery—prefer task-side idempotency (and/or external side-effect
+   de-dupe) if you need stronger outcome guarantees.
 
 ### Terminal Failure only
 
@@ -94,7 +99,8 @@ not “this attempt failed.” Polling `get_result` during retries will see
 
 ### Dead-letter queue (DLQ)
 
-- Per-queue inspect API: `Broker::list_dead(&queue)` → `Vec<DeadLetter { job, reason }>`.
+- Per-queue inspect API: `Broker::list_dead(&queue) -> Vec<DeadLetter>` (public fields
+  `job`, `reason`).
 - Terminal path calls `Broker::dead_letter(id, claim_token, reason)`; job body is
   retained for debugging.
 - **No replay / redrive API in M2** — inspect only. Operators re-enqueue manually if needed.
@@ -127,6 +133,11 @@ Configure with `App::with_retry_policy`, or convenience `with_max_attempts` /
 `with_nack_delay` (sets `base_delay` only). Public constants:
 `DEFAULT_MAX_ATTEMPTS`, `DEFAULT_BASE_DELAY`, `DEFAULT_MAX_DELAY`.
 
+A single `run_worker` drain uses non-blocking claim and **does not sleep** for nack
+delays, so under default policy it will **not** exhaust retries in one call. Re-invoke
+after the delay (tests do multi-pass with sleep), or run a continuous claim loop in
+production workers.
+
 ### Optional results (fire-and-forget)
 
 - No result backend (`App::new(broker)` only) → worker never stores outcomes;
@@ -134,6 +145,8 @@ Configure with `App::with_retry_policy`, or convenience `with_max_attempts` /
   fire-and-forget.
 - With a backend: `send` still returns `JobId`; `get_result` reads Success or
   terminal Failure; missing id → `ResultNotFound`.
+- The result backend is **not** a monotonic commit log: crash between Success store
+  and `ack` can redeliver and rewrite the stored result (see at-least-once above).
 
 ## Multi-process (Redis)
 

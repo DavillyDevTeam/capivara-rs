@@ -43,6 +43,20 @@ another claim already owns the job.
 **Write idempotent handlers** (or accept duplicate side effects). Producer
 `idempotency_key` does **not** change this (see §4).
 
+### Success store before ack (result rewrite)
+
+The success path is **store Success → `ack`** (see §2). That ordering is intentional
+for visibility of outcomes, but it is not a two-phase commit:
+
+- Crash **after** `store(Success)` and **before** `ack` leaves the lease in place.
+- Lease expiry → recover-on-claim → redelivery can run the handler again.
+- A later claim may **overwrite** the stored result (another `Success`, or terminal
+  `Failure` if retries exhaust). The result backend is **not** a monotonic commit log.
+
+**Implication:** a visible `JobResult::Success` is not a durable “done” bit until the
+claim is settled and no further redelivery can occur. Prefer task-side idempotency
+and/or external side-effect de-dupe if you need stronger outcome guarantees.
+
 ---
 
 ## 2. Terminal Failure only
@@ -79,7 +93,8 @@ aligned with inspecting the dead-letter list.
 3. If step 1 lost ownership → skip Failure so the backend does not claim terminal
    while another claim may still be in flight.
 
-Success path stores Success (if backend), then `ack`.
+Success path stores Success (if backend), then `ack`. Crash between those steps can
+redeliver and rewrite results (see §1 “Success store before ack”).
 
 ---
 
@@ -173,6 +188,18 @@ Worker wiring:
 
 Lease default remains **30s** (`App::with_lease`) — orthogonal to nack delay.
 
+### Single `run_worker` drain vs delayed retries
+
+`App::run_worker` / `Worker::run` claim with **non-blocking** `block_for` (`Duration::ZERO`)
+and **do not sleep** for nack delays. Delayed jobs are only claimable after the delay
+elapses and a later claim loop promotes them.
+
+Under default policy (base **1s**, jitter on → ≈ 0.5–1s+), **one** `run_worker(None)`
+call will **not** exhaust retries for a failing job. Operators and tests must either:
+
+- re-invoke `run_worker` after the delay (integration tests multi-pass with sleep), or
+- run a continuous claim loop (production multi-process worker).
+
 ---
 
 ## 6. Optional results (fire-and-forget)
@@ -188,6 +215,9 @@ Lease default remains **30s** (`App::with_lease`) — orthogonal to nack delay.
 
 `send` / `send_with_idempotency_key` always return `JobId` whether or not a
 backend exists; the id is only useful for results when a backend is attached.
+
+When a backend is present, treat stored results as **best-effort visibility**, not a
+durable commit log: store-then-ack Success can be rewritten after redelivery (§1).
 
 ---
 
