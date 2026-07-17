@@ -1,6 +1,6 @@
 # Architecture
 
-High-level topology and component map for **capivara** (M0–M3; M4 multi-broker path).
+High-level topology and component map for **capivara** (M0–**M4 complete**).
 Delivery promises live in [guarantees.md](guarantees.md); broker capability matrix in
 [BROKER.md](BROKER.md); this file is the structural map.
 
@@ -11,7 +11,7 @@ Delivery promises live in [guarantees.md](guarantees.md); broker capability matr
 Celery-like *system shape*, not Celery protocol interop:
 
 ```text
-register Task types → send::<T>(&args) → Broker → Worker → optional ResultBackend
+register Task / SyncTask types → send::<T>(&args) → Broker → Worker → optional ResultBackend
 ```
 
 ```mermaid
@@ -23,6 +23,7 @@ flowchart LR
   subgraph BrokerLayer["Broker"]
     MB[(MemoryBroker<br/>single process)]
     RB[(RedisBroker<br/>multi-process)]
+    QB[(RabbitBroker<br/>experimental)]
   end
 
   subgraph WorkerLayer["Worker"]
@@ -36,8 +37,10 @@ flowchart LR
 
   P -->|enqueue Job + optional idempotency_key| MB
   P -->|enqueue Job + optional idempotency_key| RB
+  P -->|enqueue Job + optional idempotency_key| QB
   MB --> W
   RB --> W
+  QB --> W
   W -->|store Success / terminal Failure| MR
   W -->|store Success / terminal Failure| RR
   P -.->|get_result JobId| MR
@@ -46,13 +49,15 @@ flowchart LR
 
 **Backends are pluggable behind traits** (`Broker`, `ResultBackend`). Today:
 
-| Role | In-process (default) | Multi-process (`redis` feature) |
-|---|---|---|
-| Queue / lease / DLQ | `MemoryBroker` | `RedisBroker` |
-| Optional results | `MemoryResultBackend` | `RedisResultBackend` |
+| Role | In-process (default) | Multi-process (`redis` feature) | Experimental (`rabbitmq` feature) |
+|---|---|---|---|
+| Queue / settle / DLQ | `MemoryBroker` | `RedisBroker` (LIST + lease) | `RabbitBroker` (lapin; **no** timed lease) |
+| Optional results | `MemoryResultBackend` | `RedisResultBackend` | Pair with Memory/Redis results (no Rabbit result backend) |
 
 - **Memory** is for tests and single-process apps — not shared across OS processes.
 - **Redis** shares the same `RedisConfig` (`url` + `prefix`) between producer and worker.
+- **Rabbit** is a feature-gated **spike** for multi-worker experiments — not Redis
+  parity; gaps in [BROKER.md](BROKER.md).
 - Omitting a result backend is intentional **fire-and-forget** (`get_result` → `NoResultBackend`).
 - Full capability checklist (Memory / Redis / experimental Rabbit; Kafka not planned):
   [BROKER.md](BROKER.md).
@@ -65,9 +70,10 @@ flowchart LR
 src/
   app.rs       App: register, send, run_worker, get_result, policy knobs
   task.rs      Task trait (NAME, Args, Output, async run)
+  task_sync.rs SyncTask + run_blocking (spawn_blocking bridge)
   registry.rs  name → handler map
   job.rs       Job, JobId, QueueName
-  broker/      Broker trait + Memory + optional Redis
+  broker/      Broker trait + Memory + optional Redis + optional Rabbit
   result/      ResultBackend trait + Memory + optional Redis
   worker/      claim loop, concurrency semaphore, settle paths
   retry.rs     RetryPolicy (exponential + equal jitter)
@@ -79,8 +85,9 @@ src/
 |---|---|
 | **`App`** | Facade: owns broker, optional result backend, registry, lease / concurrency / retry policy |
 | **`Task`** | Typed unit of work; JSON serde for args/output; native async `run` |
-| **`Broker`** | `enqueue`, `claim` (lease + recover-on-claim), `ack` / `nack` / `dead_letter`, `list_dead` |
-| **`ClaimToken`** | Opaque token per claim; late settle cannot steal a reclaimed job |
+| **`SyncTask` / `run_blocking`** | Sync/blocking handlers via Tokio `spawn_blocking` (no `#[task]` macro) |
+| **`Broker`** | `enqueue`, `claim` (lease + recover-on-claim where supported), `ack` / `nack` / `dead_letter`, `list_dead` |
+| **`ClaimToken`** | Opaque token per claim; late settle cannot steal a reclaimed job (process-local on Rabbit spike) |
 | **`Worker`** | Concurrent drain: claim → run (panic-isolated) → store? → settle |
 | **`ResultBackend`** | Best-effort visibility of Success / terminal Failure by `JobId` |
 | **`RetryPolicy`** | Shared nack delay schedule; `max_attempts` before DLQ |
@@ -156,9 +163,11 @@ App wiring snippets: README [Observability](../README.md#observability).
 - Exactly-once execution end-to-end
 - DLQ automatic redrive / replay API
 - Cross-process Memory broker
-- **Kafka** broker (not planned). Experimental `RabbitBroker` (`rabbitmq` feature)
-  exists with documented gaps — see [BROKER.md](BROKER.md); not Redis parity
-- crates.io publish while `publish = false` (discuss **0.1.0** with the maintainer after M3)
+- **Kafka** broker (**not planned**). Experimental `RabbitBroker` (`rabbitmq` feature)
+  exists with documented gaps — see [BROKER.md](BROKER.md); not Redis parity / not production
+- **`#[task]` proc-macro** — optional M4-4 **skipped**; use `Task` / `SyncTask`
+- crates.io publish while `publish = false` — stay **`0.0.1`**; post-M3 **0.1.0**
+  discussion remains **open** (no unilateral publish or version bump)
 
 When topology or guarantees change, update this file, [guarantees.md](guarantees.md),
 [BROKER.md](BROKER.md), and the README together.
