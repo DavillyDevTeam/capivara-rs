@@ -86,6 +86,11 @@ pub struct DeadLetter {
 #[async_trait]
 pub trait Broker: Send + Sync {
     /// Enqueue a job; returns its id.
+    ///
+    /// When [`Job::idempotency_key`] is `Some(key)` and the key was already
+    /// recorded, returns the **existing** [`JobId`] without creating a duplicate
+    /// queue entry. This is for **safe producer retries** only: in-flight worker
+    /// crashes still deliver at-least-once (tasks should remain idempotent).
     async fn enqueue(&self, job: Job) -> Result<JobId>;
 
     /// Claim the next available job from any of `queues`.

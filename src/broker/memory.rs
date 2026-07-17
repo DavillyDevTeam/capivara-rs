@@ -5,6 +5,9 @@
 //!
 //! Dead-lettered jobs are kept in an in-process per-queue list with reason
 //! (inspect via [`Broker::list_dead`]; no replay in M2).
+//!
+//! Producer [`Job::idempotency_key`] values are stored in an in-process map
+//! (`key → JobId`) under the broker mutex.
 
 use crate::broker::{Broker, ClaimToken, ClaimedJob, DeadLetter, NackAction};
 use crate::error::{CapivaraError, Result};
@@ -28,6 +31,8 @@ struct Inner {
     delayed: Vec<(Instant, Job)>,
     /// queue name -> dead-lettered jobs (oldest first)
     dead: HashMap<String, Vec<DeadLetter>>,
+    /// producer idempotency_key → first JobId (safe producer retries)
+    idempotency: HashMap<String, JobId>,
 }
 
 struct InFlight {
@@ -76,8 +81,17 @@ impl MemoryBroker {
 #[async_trait]
 impl Broker for MemoryBroker {
     async fn enqueue(&self, job: Job) -> Result<JobId> {
-        let id = job.id;
         let mut guard = self.inner.lock().await;
+        // Producer idempotency: same key → existing JobId, no second queue entry.
+        if let Some(ref key) = job.idempotency_key {
+            if let Some(existing) = guard.idempotency.get(key) {
+                return Ok(*existing);
+            }
+        }
+        let id = job.id;
+        if let Some(ref key) = job.idempotency_key {
+            guard.idempotency.insert(key.clone(), id);
+        }
         let q = job.queue.as_str().to_string();
         guard.pending.entry(q).or_default().push_back(job);
         Ok(id)

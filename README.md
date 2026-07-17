@@ -13,18 +13,21 @@ a universal CLI that runs arbitrary remote code.
 | **Package** | `capivara` (repo: [`capivara-rs`](https://github.com/DavillyDevTeam/capivara-rs)) |
 | **Org** | [DavillyDevTeam](https://github.com/DavillyDevTeam) |
 | **License** | MIT OR Apache-2.0 |
-| **Status** | M2 (in progress): DLQ + terminal Failure; M1 Memory + Redis + concurrency |
+| **Status** | M2 (in progress): DLQ + terminal Failure + producer idempotency; M1 Memory + Redis + concurrency |
 
 ## What works today (M0–M2)
 
 - Typed **`Task`** trait (`NAME`, `Args`, `Output`, native async `run`)
-- **`App`**: `register` / `send` / `run_worker` / `get_result`
+- **`App`**: `register` / `send` / `send_with_idempotency_key` / `run_worker` / `get_result`
   - optional `with_result_backend`, `with_default_queue`
   - `broker()` for shared broker access / advanced raw `Job` enqueue
   - worker policy: `with_lease` (default **30s**), `with_concurrency` (default **4**),
     `RetryPolicy` via `with_retry_policy` (defaults: **max_attempts 3**, **base_delay 1s**,
     **max_delay 15m**, **equal jitter** on);
     convenience: `with_max_attempts`, `with_nack_delay` (sets `base_delay` only)
+  - **producer idempotency**: optional key on enqueue returns the existing `JobId` (no
+    duplicate queue entry). For safe **producer retries** only — **at-least-once** still
+    applies for in-flight worker crashes; tasks should remain idempotent
 - **`MemoryBroker`** + optional **`MemoryResultBackend`**
   - **Single-process only** — not shared across OS processes; not a distributed queue
 - Optional **`RedisBroker`** + **`RedisResultBackend`** (`redis` feature)
@@ -72,6 +75,7 @@ Producer and worker are separate OS processes that share Redis:
 2. Producer: `RedisBroker` (+ optional `RedisResultBackend` if it will call `get_result`).
 3. Worker: same `RedisBroker` + same `RedisResultBackend`, `register` the same task types, then `run_worker` (or a long-running loop around it).
 4. At-least-once delivery: a crashed worker’s claim expires (default lease **30s**); **recover-on-claim** requeues the job. Tasks should be **idempotent**. Failures retry with exponential `nack` delay (`RetryPolicy`: base **1s**, max **15m**, equal jitter) up to `max_attempts` (default **3**), then dead-letter; panics count as failures. Intermediate retries do not store `JobResult::Failure`.
+5. **Producer retries**: use `App::send_with_idempotency_key` (or set `Job.idempotency_key` on raw enqueue). The broker maps `key → JobId` (Memory: HashMap; Redis: `{prefix}idempotency:{key}` SET NX) and returns the existing id on collision. This does **not** cancel at-least-once worker redelivery after a crash mid-execution.
 
 ```rust
 // Producer process

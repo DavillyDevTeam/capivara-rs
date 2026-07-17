@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Producer idempotency key**: optional `Job.idempotency_key` (`#[serde(default)]`) and
+  `App::send_with_idempotency_key`. On enqueue with a key, Memory/Redis return the existing
+  `JobId` if the key was already seen (no duplicate queue entry). Redis uses
+  `{prefix}idempotency:{key}` SET NX (Lua with SET job + LPUSH). **At-least-once still
+  applies** for in-flight worker crashes — the key is for safe producer retries only.
 - **Per-queue dead-letter queue (DLQ)**: `Broker::dead_letter(id, claim_token, reason)` and
   `Broker::list_dead(queue)` (inspect only; **no replay** in M2). Job body retained.
   - Memory: in-process per-queue dead list with reason.
