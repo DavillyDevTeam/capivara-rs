@@ -67,6 +67,7 @@ mod error;
 mod job;
 mod registry;
 mod result;
+mod retry;
 mod task;
 mod worker;
 
@@ -79,4 +80,5 @@ pub use job::{Job, JobId, QueueName};
 #[cfg(feature = "redis")]
 pub use result::{DEFAULT_RESULT_TTL, RedisResultBackend};
 pub use result::{JobResult, MemoryResultBackend, ResultBackend};
+pub use retry::RetryPolicy;
 pub use task::Task;
