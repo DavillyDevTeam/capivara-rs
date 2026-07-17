@@ -172,6 +172,67 @@ async fn rabbit_nack_requeue_preserves_attempts() {
 }
 
 #[tokio::test]
+async fn rabbit_delayed_nack_ttl_dlx_hop() {
+    let (_guard, url) = rabbit_url().await;
+    let broker = RabbitBroker::connect(RabbitConfig::new(url).with_prefix("capivara_delay:"))
+        .await
+        .unwrap();
+
+    let mut job = Job::new("ping", br#"{"msg":"later"}"#.to_vec());
+    job.queue = QueueName::new("default");
+    let id = broker.enqueue(job).await.unwrap();
+
+    let claimed = broker
+        .claim(
+            &[QueueName::default()],
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap()
+        .expect("claim 1");
+    assert_eq!(claimed.job.attempts, 1);
+
+    let delay = Duration::from_millis(400);
+    broker
+        .nack(
+            &id,
+            &claimed.claim_token,
+            NackAction::RequeueAfter { delay },
+        )
+        .await
+        .unwrap();
+
+    // Immediately after delayed nack, ready queue should be empty.
+    let none = broker
+        .claim(
+            &[QueueName::default()],
+            Duration::from_secs(30),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert!(none.is_none(), "job should still be on delayed hop");
+
+    // Wait past TTL; claim with block_for covering the hop.
+    let claimed2 = broker
+        .claim(
+            &[QueueName::default()],
+            Duration::from_secs(30),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap()
+        .expect("claim 2 after delayed hop");
+    assert_eq!(claimed2.job.id, id);
+    assert_eq!(
+        claimed2.job.attempts, 2,
+        "attempts must survive TTL+DLX delayed nack"
+    );
+    broker.ack(&id, &claimed2.claim_token).await.unwrap();
+}
+
+#[tokio::test]
 async fn rabbit_dead_letter_and_list_dead() {
     let (_guard, url) = rabbit_url().await;
     let broker = RabbitBroker::connect(RabbitConfig::new(url).with_prefix("capivara_dlq:"))

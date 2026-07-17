@@ -29,7 +29,18 @@
 //! - **Delayed nack:** implemented via TTL + DLX hop on `:delayed` (not an
 //!   in-process delayed list / Redis delayed ZSET). Mixed TTLs on one delay
 //!   queue can reorder; fine for a spike.
+//! - **Settle is ack-then-republish:** `nack` / `dead_letter` ack the original
+//!   delivery first, then publish the updated body. A crash (or channel death)
+//!   between those steps **drops the job** with no redelivery — weaker than
+//!   Memory/Redis atomic settle and weaker than leaving the message unacked.
 //! - **Producer `idempotency_key`:** process-local map only (not multi-process).
+//!   The key is recorded **only after a successful publish** so a failed
+//!   enqueue does not poison retries. Concurrent same-key enqueues in one
+//!   process may still rare-race double-publish.
+//! - **Persistence:** queues are durable and publishes use `delivery_mode = 2`
+//!   (persistent), but **publisher confirms are not enabled** (`confirm_select`
+//!   is not called); the publish future’s second `.await` is typically
+//!   `NotRequested`. Do not treat this spike as crash-durable enqueue.
 //! - **`list_dead`:** best-effort `basic_get` + requeue; not a durable admin API.
 //! - **Queue depth metric:** not updated on the hot path.
 
@@ -49,6 +60,9 @@ use tokio::sync::Mutex;
 
 /// AMQP header used when publishing to the dead-letter queue.
 const DEAD_REASON_HEADER: &str = "x-capivara-dead-reason";
+
+/// AMQP delivery mode: persistent (survives broker restart when queues are durable).
+const DELIVERY_MODE_PERSISTENT: u8 = 2;
 
 /// Connection / queue-namespace settings for [`RabbitBroker`].
 #[derive(Debug, Clone)]
@@ -184,7 +198,11 @@ impl RabbitBroker {
         props: BasicProperties,
     ) -> Result<()> {
         let body = serde_json::to_vec(job)?;
-        let props = props.with_content_type(ShortString::from("application/json"));
+        // Persistent bodies + durable queues reduce broker-restart loss; we still
+        // do not call confirm_select, so the second await is usually NotRequested.
+        let props = props
+            .with_content_type(ShortString::from("application/json"))
+            .with_delivery_mode(DELIVERY_MODE_PERSISTENT);
         self.channel
             .basic_publish(
                 "",
@@ -252,12 +270,14 @@ impl RabbitBroker {
 impl Broker for RabbitBroker {
     async fn enqueue(&self, job: Job) -> Result<JobId> {
         // Process-local idempotency only (documented gap vs Redis multi-process map).
+        // Lookup before publish; record **only after** a successful publish so a
+        // failed enqueue does not return Ok(existing) on retry without a queue body.
+        // Concurrent same-key enqueues may rare-race double-publish (spike tradeoff).
         if let Some(ref key) = job.idempotency_key {
-            let mut map = self.idempotency.lock().await;
+            let map = self.idempotency.lock().await;
             if let Some(existing) = map.get(key) {
                 return Ok(*existing);
             }
-            map.insert(key.clone(), job.id);
         }
 
         let queue = job.queue.as_str().to_string();
@@ -266,6 +286,12 @@ impl Broker for RabbitBroker {
         let id = job.id;
         self.publish_json(&ready, &job, BasicProperties::default())
             .await?;
+
+        if let Some(ref key) = job.idempotency_key {
+            let mut map = self.idempotency.lock().await;
+            // First successful publisher to finish wins the map entry.
+            map.entry(key.clone()).or_insert(id);
+        }
         Ok(id)
     }
 
@@ -328,8 +354,10 @@ impl Broker for RabbitBroker {
         let queue = job.queue.as_str().to_string();
         self.ensure_topology(&queue).await?;
 
-        // Always ack the original delivery, then re-publish with updated attempts.
+        // Ack-then-republish so the body carries updated `attempts`.
         // (basic_nack requeue=true would restore the pre-claim body and stall attempts.)
+        // Crash window: if we die after ack and before publish, the job is lost
+        // (documented gap vs Memory/Redis atomic settle).
         entry
             .acker
             .ack(BasicAckOptions::default())
@@ -357,6 +385,7 @@ impl Broker for RabbitBroker {
         let queue = job.queue.as_str().to_string();
         self.ensure_topology(&queue).await?;
 
+        // Ack-then-publish to `:dead`. Same crash-between-steps loss window as nack.
         entry
             .acker
             .ack(BasicAckOptions::default())

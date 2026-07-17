@@ -24,10 +24,18 @@ Stabilize the shared `Broker` contract and land an **experimental** RabbitMQ spi
   `{prefix}{queue}:delayed`, best-effort `list_dead`.
 - **Honest gaps** (not Redis parity) documented in [`docs/BROKER.md`](docs/BROKER.md):
   no timed lease/recover (`lease` ignored), process-local claim tokens and
-  `idempotency_key`, best-effort `list_dead`, no hot-path queue-depth metric.
-  Multi-process workers are broker-native (shared AMQP URL + prefix).
+  `idempotency_key`, ack-then-republish settle crash window, durable queues +
+  persistent delivery mode but **no** publisher confirms, best-effort `list_dead`,
+  no hot-path queue-depth metric. Multi-process workers are broker-native
+  (shared AMQP URL + prefix).
 - Integration tests `tests/rabbitmq_broker.rs` (testcontainers RabbitMQ image, or
-  `RABBITMQ_URL` / `AMQP_URL`); worker happy path with `MemoryResultBackend`.
+  `RABBITMQ_URL` / `AMQP_URL`); worker happy path with `MemoryResultBackend`;
+  delayed nack TTL+DLX hop covered.
+
+### Fixed
+
+- Rabbit process-local `idempotency_key` is recorded **only after** a successful
+  publish (failed enqueue no longer poisons producer retries with a phantom id).
 
 #### Broker capability matrix (M4-1)
 

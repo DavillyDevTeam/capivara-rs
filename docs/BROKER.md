@@ -118,12 +118,22 @@ Rabbit section below. Do not treat Rabbit as parity with Redis.
      redelivers). Crash recovery is connection-drop redelivery, not lease ZSET.
   2. **Delayed nack** uses ack + publish to `:delayed` with per-message TTL + DLX;
      not Redis delayed ZSET. Mixed TTLs on one delay queue can reorder.
-  3. **Claim tokens** are process-local (delivery tag / `Acker` map). Correct
+  3. **Settle is ack-then-republish** — `nack` / `dead_letter` ack the original
+     delivery first, then publish the updated body (needed so `attempts` survives).
+     A crash or channel death **between** those steps **can lose the job** with no
+     redelivery — not Redis-style atomic settle, and weaker than leaving unacked.
+  4. **Claim tokens** are process-local (delivery tag / `Acker` map). Correct
      multi-worker *delivery* is broker-native; late-settle token checks do not
      span processes.
-  4. **Producer `idempotency_key`** is process-local only (no shared store).
-  5. **`list_dead`** is best-effort inspect (`basic_get` + requeue, capped).
-  6. No hot-path `capivara_queue_depth` updates.
+  5. **Producer `idempotency_key`** is process-local only (no shared store). The
+     key is recorded **only after a successful publish** (failed enqueue does not
+     poison retries). Concurrent same-key enqueues in one process may rare-race
+     double-publish.
+  6. **Persistence limits** — durable queues + `delivery_mode = 2` (persistent)
+     bodies, but **no publisher confirms** (`confirm_select` not used). Do not
+     treat the spike as fully crash-durable enqueue under broker/network failure.
+  7. **`list_dead`** is best-effort inspect (`basic_get` + requeue, capped).
+  8. No hot-path `capivara_queue_depth` updates.
 - Production readiness is **not** a goal of this spike.
 
 ### Kafka

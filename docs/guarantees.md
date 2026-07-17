@@ -5,7 +5,7 @@ and the design decisions behind those promises. For a shorter operator-facing su
 see the README sections [Failure modes in 10 minutes](../README.md#failure-modes-in-10-minutes)
 and [Delivery guarantees & failure modes](../README.md#delivery-guarantees--failure-modes).
 Structural map: [ARCHITECTURE.md](ARCHITECTURE.md). Broker capability matrix (Memory /
-Redis / Rabbit next): [BROKER.md](BROKER.md).
+Redis / experimental Rabbit `rabbitmq` feature): [BROKER.md](BROKER.md).
 
 APIs referenced: `App`, `Broker`, `RetryPolicy`, `JobResult`, `DeadLetter`,
 `ClaimToken`, `send_with_idempotency_key`.
