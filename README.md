@@ -15,7 +15,7 @@ a universal CLI that runs arbitrary remote code.
 | **License** | MIT OR Apache-2.0 |
 | **Status** | M2 (in progress): DLQ + terminal Failure; M1 Memory + Redis + concurrency |
 
-## What works today (M0 / M1)
+## What works today (M0–M2)
 
 - Typed **`Task`** trait (`NAME`, `Args`, `Output`, native async `run`)
 - **`App`**: `register` / `send` / `run_worker` / `get_result`
@@ -29,13 +29,14 @@ a universal CLI that runs arbitrary remote code.
   - **Single-process only** — not shared across OS processes; not a distributed queue
 - Optional **`RedisBroker`** + **`RedisResultBackend`** (`redis` feature)
   - LIST + lease, Lua claim/ack/nack, delayed requeue
-  - **lease recover-on-claim**, **claim tokens** (late ack/nack cannot steal a newer claim)
+  - **lease recover-on-claim**, **claim tokens** (late ack/nack/dead_letter cannot steal a newer claim)
   - results as `{prefix}result:{id}` STRING JSON with **24h TTL**
 - Worker concurrency: Tokio tasks limited by a semaphore (default **4**)
 - Worker retry policy: task `Err` / panic → **no intermediate Failure store** →
   `nack(RequeueAfter)` with **exponential backoff + equal jitter** until
-  `max_attempts`, then store terminal `Failure` (if backend) + `dead_letter(reason)`
-  (unknown task name is always terminal DLQ; lost-lease settle is non-fatal)
+  `max_attempts`, then `dead_letter(reason)` and store terminal `Failure` only if
+  ownership was confirmed (unknown task is always terminal DLQ; lost-lease settle
+  is non-fatal and does **not** write Failure)
 - Per-queue **dead-letter list** (`Broker::dead_letter` / `list_dead`); job body kept for inspect; **no replay** in M2
 - Claim-scoped ownership: each claim issues a `ClaimToken` required by `ack`/`nack`/`dead_letter`
 - Panic isolation at the task boundary (worker keeps going)

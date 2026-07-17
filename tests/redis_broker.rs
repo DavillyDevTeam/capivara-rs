@@ -424,6 +424,73 @@ async fn redis_late_ack_after_recover_does_not_steal_new_claim() {
     assert!(none.is_none());
 }
 
+#[tokio::test]
+async fn redis_late_dead_letter_after_recover_does_not_steal_new_claim() {
+    let (_guard, url) = redis_url().await;
+    let broker = RedisBroker::connect(RedisConfig::new(url).with_prefix("capivara_late_dlq:"))
+        .await
+        .unwrap();
+
+    let mut job = Job::new("ping", br#"{"msg":"dlq-steal"}"#.to_vec());
+    job.queue = QueueName::default();
+    let id = broker.enqueue(job).await.unwrap();
+
+    let short_lease = Duration::from_millis(200);
+    let claim_a = broker
+        .claim(&[QueueName::default()], short_lease, Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("claim A");
+    assert_eq!(claim_a.job.id, id);
+    let token_a = claim_a.claim_token;
+
+    // Expire lease; recover-on-claim requeues; B claims with a new token.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let claim_b = broker
+        .claim(
+            &[QueueName::default()],
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .expect("claim B after recover");
+    assert_eq!(claim_b.job.id, id);
+    assert_ne!(token_a, claim_b.claim_token);
+
+    // Late dead_letter from A must fail and must not append a DLQ entry.
+    let err = broker
+        .dead_letter(&id, &token_a, "stale claim A")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CapivaraError::JobNotFound { .. }));
+    let dead = broker.list_dead(&QueueName::default()).await.unwrap();
+    assert!(
+        dead.is_empty(),
+        "late dead_letter must not write DLQ: {dead:?}"
+    );
+
+    // B still owns the claim and can dead-letter.
+    broker
+        .dead_letter(&id, &claim_b.claim_token, "owned by B")
+        .await
+        .unwrap();
+    let dead = broker.list_dead(&QueueName::default()).await.unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].job.id, id);
+    assert_eq!(dead[0].reason, "owned by B");
+
+    let none = broker
+        .claim(
+            &[QueueName::default()],
+            Duration::from_secs(30),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert!(none.is_none());
+}
+
 struct AlwaysFails;
 
 impl Task for AlwaysFails {

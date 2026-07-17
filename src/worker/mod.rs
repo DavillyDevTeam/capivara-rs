@@ -7,8 +7,9 @@
 //! limited by a [`tokio::sync::Semaphore`].
 //!
 //! **Result policy:** `JobResult::Failure` is stored only on **terminal**
-//! outcomes (max attempts exhausted → dead-letter, or unknown task). Intermediate
-//! retries leave the result backend empty (`ResultNotFound`).
+//! outcomes after a successful `dead_letter` (max attempts exhausted or unknown
+//! task). Intermediate retries and lost-lease races leave the result backend
+//! empty (`ResultNotFound`).
 
 use crate::broker::{Broker, ClaimToken, ClaimedJob, NackAction};
 use crate::error::{CapivaraError, Result};
@@ -50,15 +51,18 @@ impl Worker {
     /// - Success → store Success (if backend) → ack
     /// - Err / panic, `attempts < max_attempts` → **no** result store →
     ///   nack(RequeueAfter { delay: policy.delay_for_attempt(attempts) })
-    /// - Err / panic, `attempts >= max_attempts` → store Failure (if backend) →
-    ///   dead_letter(reason)
-    /// - Unknown task → store Failure (if backend) → dead_letter("unknown task…")
+    /// - Err / panic, `attempts >= max_attempts` → dead_letter(reason), then
+    ///   store Failure **only if** dead_letter confirmed ownership
+    /// - Unknown task → dead_letter("unknown task…"), then store Failure only
+    ///   if dead_letter confirmed ownership
     ///
     /// Nack delay is computed via [`RetryPolicy::delay_for_attempt`] from the
     /// job's current claim count (`Job.attempts`).
     ///
     /// Lost-lease `JobNotFound` from ack/nack/dead_letter is non-fatal (another
-    /// claim may already own the job after recover); the drain continues.
+    /// claim may already own the job after recover); the drain continues and
+    /// Failure is **not** stored when dead_letter loses the race (keeps
+    /// `JobResult::Failure` ≈ terminal).
     ///
     /// Concurrency: claims while under `concurrency` and under `max_jobs`; each
     /// claimed job keeps its own [`ClaimToken`]. When the broker is empty and
@@ -195,16 +199,21 @@ impl Worker {
         }
     }
 
-    /// Dead-letter; treat lost ownership as non-fatal so the drain keeps going.
+    /// Dead-letter this claim.
+    ///
+    /// Returns `Ok(true)` if ownership was confirmed and the job was moved to
+    /// the DLQ. Returns `Ok(false)` if the claim was already lost (`JobNotFound`)
+    /// so the caller can skip storing terminal Failure. Other broker errors
+    /// propagate.
     async fn settle_dead_letter(
         broker: &Arc<dyn Broker>,
         id: &JobId,
         claim_token: &ClaimToken,
         reason: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         match broker.dead_letter(id, claim_token, reason).await {
-            Ok(()) => Ok(()),
-            Err(CapivaraError::JobNotFound { .. }) => Ok(()),
+            Ok(()) => Ok(true),
+            Err(CapivaraError::JobNotFound { .. }) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -237,7 +246,7 @@ fn account_join(
     }
 }
 
-/// Run a single claimed job: handler → (maybe) store → ack/nack/dead_letter.
+/// Run a single claimed job: handler → ack/nack/dead_letter → (maybe) store.
 async fn process_one(
     broker: Arc<dyn Broker>,
     results: Option<Arc<dyn ResultBackend>>,
@@ -255,19 +264,16 @@ async fn process_one(
         Ok(h) => h,
         Err(e) => {
             let message = e.to_string();
-            if let Some(backend) = &results {
-                backend
-                    .store(
-                        &job_id,
-                        JobResult::Failure {
-                            message: message.clone(),
-                        },
-                    )
-                    .await?;
-            }
-            // Unknown task is terminal — dead-letter for inspectability.
+            // Unknown task is terminal — dead-letter first so Failure ≈ ownership.
             let reason = format!("unknown task: {task_name}");
-            Worker::settle_dead_letter(&broker, &job_id, &claim_token, &reason).await?;
+            let owned = Worker::settle_dead_letter(&broker, &job_id, &claim_token, &reason).await?;
+            if owned {
+                if let Some(backend) = &results {
+                    backend
+                        .store(&job_id, JobResult::Failure { message })
+                        .await?;
+                }
+            }
             return Ok(());
         }
     };
@@ -309,18 +315,17 @@ async fn process_one(
                 )
                 .await?;
             } else {
-                // Terminal: store Failure (if backend) → dead_letter (clears claim).
-                if let Some(backend) = &results {
-                    backend
-                        .store(
-                            &job_id,
-                            JobResult::Failure {
-                                message: message.clone(),
-                            },
-                        )
-                        .await?;
+                // Terminal: dead_letter first; store Failure only if we still own
+                // the claim (avoids Failure while another claim may still run).
+                let owned =
+                    Worker::settle_dead_letter(&broker, &job_id, &claim_token, &message).await?;
+                if owned {
+                    if let Some(backend) = &results {
+                        backend
+                            .store(&job_id, JobResult::Failure { message })
+                            .await?;
+                    }
                 }
-                Worker::settle_dead_letter(&broker, &job_id, &claim_token, &message).await?;
             }
         }
     }

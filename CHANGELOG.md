@@ -51,7 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Terminal-only `JobResult::Failure`**: intermediate retries no longer store Failure;
-  only max-attempts exhaustion and unknown-task outcomes write Failure (if a result backend is set).
+  only max-attempts exhaustion and unknown-task outcomes write Failure (if a result backend is set),
+  and only **after** a successful `dead_letter` (lost-lease races skip Failure so it stays ≈ terminal).
 - Terminal outcomes use `dead_letter` (not bare `ack`) so failed jobs are inspectable on the DLQ.
 - Nack requeue delay is no longer a fixed **5s**; it follows [`RetryPolicy`] exponential
   schedule (base **1s**, cap **15m**, equal jitter on by default).
