@@ -159,16 +159,19 @@ impl App {
         job.queue = self.default_queue.clone();
         job.idempotency_key = idempotency_key;
 
+        let queue = job.queue.as_str().to_string();
         let span = tracing::info_span!(
             "capivara.enqueue",
             job.id = %job.id,
             task.name = T::NAME,
-            queue = job.queue.as_str(),
+            queue = queue.as_str(),
             attempt = job.attempts,
         );
-        async move { self.broker.enqueue(job).await }
+        let id = async move { self.broker.enqueue(job).await }
             .instrument(span)
-            .await
+            .await?;
+        crate::metrics::record_enqueued(&queue, T::NAME);
+        Ok(id)
     }
 
     /// Fetch a stored result. Errors if no backend is configured.

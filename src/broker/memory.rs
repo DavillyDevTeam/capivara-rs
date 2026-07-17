@@ -8,10 +8,15 @@
 //!
 //! Producer [`Job::idempotency_key`] values are stored in an in-process map
 //! (`key → JobId`) under the broker mutex.
+//!
+//! Best-effort metrics: updates `capivara_queue_depth` from in-process pending
+//! length after enqueue/claim/nack. Cheap (no network). Redis does not do this
+//! on the hot path (LLEN is documented as costly).
 
 use crate::broker::{Broker, ClaimToken, ClaimedJob, DeadLetter, NackAction};
 use crate::error::{CapivaraError, Result};
 use crate::job::{Job, JobId, QueueName};
+use crate::metrics;
 use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -76,6 +81,15 @@ impl MemoryBroker {
         }
         inner.delayed = keep;
     }
+
+    /// Pending (ready) depth only — not delayed or in-flight.
+    fn pending_depth(inner: &Inner, queue: &str) -> usize {
+        inner.pending.get(queue).map(|d| d.len()).unwrap_or(0)
+    }
+
+    fn record_pending_depth(inner: &Inner, queue: &str) {
+        metrics::set_queue_depth(queue, Self::pending_depth(inner, queue));
+    }
 }
 
 #[async_trait]
@@ -97,7 +111,8 @@ impl Broker for MemoryBroker {
             guard.idempotency.insert(key.clone(), id);
         }
         let q = job.queue.as_str().to_string();
-        guard.pending.entry(q).or_default().push_back(job);
+        guard.pending.entry(q.clone()).or_default().push_back(job);
+        Self::record_pending_depth(&guard, &q);
         Ok(id)
     }
 
@@ -136,6 +151,7 @@ impl Broker for MemoryBroker {
                                     token: claim_token.clone(),
                                 },
                             );
+                            Self::record_pending_depth(&guard, q);
                             return Ok(Some(ClaimedJob { job, claim_token }));
                         }
                     }
@@ -179,7 +195,8 @@ impl Broker for MemoryBroker {
             NackAction::RequeueAfter { delay } => {
                 if delay.is_zero() {
                     let q = job.queue.as_str().to_string();
-                    guard.pending.entry(q).or_default().push_back(job);
+                    guard.pending.entry(q.clone()).or_default().push_back(job);
+                    Self::record_pending_depth(&guard, &q);
                 } else {
                     guard.delayed.push((Instant::now() + delay, job));
                 }

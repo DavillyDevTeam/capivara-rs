@@ -27,6 +27,7 @@ tracing = "0.1"
 uuid = { version = "1.23.4", features = ["v4", "serde"] }
 redis = { version = "0.27", optional = true, default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
 rand = "0.8"
+metrics = "0.24"
 
 [lib]
 name = "capivara"
@@ -38,6 +39,7 @@ testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["redis"] }
 # For Redis TTL assertions in integration tests (same feature set as optional dep).
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 
 [[test]]
 name = "redis_broker"
