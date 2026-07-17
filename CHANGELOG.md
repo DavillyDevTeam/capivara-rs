@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`RetryPolicy`** (shared across Memory/Redis worker paths): exponential backoff with optional
+  **equal jitter**. Defaults: `max_attempts` **3**, `base_delay` **1s**, `max_delay` **15m**,
+  `jitter` **true**. Worker nack delay is `delay_for_attempt(job.attempts)`.
+- `App::with_retry_policy`; `with_max_attempts` / `with_nack_delay` remain as convenience
+  mutators (`with_nack_delay` sets `base_delay` only).
+- Public defaults: `DEFAULT_MAX_ATTEMPTS`, `DEFAULT_BASE_DELAY`, `DEFAULT_MAX_DELAY`.
 - **`RedisResultBackend`** (`redis` feature): `{prefix}result:{id}` STRING JSON `JobResult`,
   default TTL **24h** (`EX 86400`); shares [`RedisConfig`] with the broker.
 - `CapivaraError::ResultBackend` for result-backend I/O (distinct from `Broker`).
@@ -21,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Redis claim **atomically INCRs** `{prefix}attempts:{id}` with lease (attempt counter independent of body JSON).
 - Worker treats `JobNotFound` on settle as non-fatal (drain continues after lost lease).
 - Worker delayed-nack policy: task `Err`/panic retries via `nack(RequeueAfter)` until
-  `max_attempts` (default **3**), then terminal `ack`. Defaults: lease **30s**, nack delay **5s**.
+  `max_attempts` (default **3**), then terminal `ack`. Defaults: lease **30s**.
 - `App::with_lease` / `with_max_attempts` (clamped ≥ 1) / `with_nack_delay` for worker policy.
 - Optional Cargo feature `redis` with `RedisBroker` + `RedisResultBackend` (LIST + lease, Lua claim/ack/nack, delayed requeue).
 - Extended `Broker` trait: `claim(queues, lease, block_for)`, `nack(RequeueAfter)`; `ClaimedJob`.
@@ -39,6 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Nack requeue delay is no longer a fixed **5s**; it follows [`RetryPolicy`] exponential
+  schedule (base **1s**, cap **15m**, equal jitter on by default).
 - Worker drain is concurrent (default 4 in-flight); claim tokens remain per-job.
 - Redis lease ZSET members use `{queue}\x1f{id}\x1f{token}`; delayed remains `{queue}\x1f{id}`.
 - Package version set to **`0.0.1`** with **`publish = false`** until a real release.

@@ -80,5 +80,5 @@ pub use job::{Job, JobId, QueueName};
 #[cfg(feature = "redis")]
 pub use result::{DEFAULT_RESULT_TTL, RedisResultBackend};
 pub use result::{JobResult, MemoryResultBackend, ResultBackend};
-pub use retry::RetryPolicy;
+pub use retry::{DEFAULT_BASE_DELAY, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_DELAY, RetryPolicy};
 pub use task::Task;

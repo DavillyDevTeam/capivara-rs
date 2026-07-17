@@ -5,7 +5,8 @@
 
 use capivara::{
     App, Broker, CapivaraError, DEFAULT_RESULT_TTL, Job, JobResult, MemoryResultBackend,
-    NackAction, QueueName, RedisBroker, RedisConfig, RedisResultBackend, Task, TaskError,
+    NackAction, QueueName, RedisBroker, RedisConfig, RedisResultBackend, RetryPolicy, Task,
+    TaskError,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -442,10 +443,17 @@ async fn redis_worker_retries_then_terminal() {
         .await
         .unwrap();
 
+    // Deterministic policy: no jitter so sleep matches exact exponential delays.
+    let base_delay = Duration::from_millis(80);
+    let policy = RetryPolicy {
+        max_attempts: 3,
+        base_delay,
+        max_delay: Duration::from_secs(60),
+        jitter: false,
+    };
     let app = App::new(broker)
         .with_result_backend(MemoryResultBackend::new())
-        .with_max_attempts(3)
-        .with_nack_delay(Duration::from_millis(80));
+        .with_retry_policy(policy);
     app.register::<AlwaysFails>().await.unwrap();
 
     let id = app
@@ -455,7 +463,6 @@ async fn redis_worker_retries_then_terminal() {
         .await
         .unwrap();
 
-    let nack_delay = Duration::from_millis(80);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut total = 0usize;
     while total < 3 && std::time::Instant::now() < deadline {
@@ -463,7 +470,8 @@ async fn redis_worker_retries_then_terminal() {
         if total >= 3 {
             break;
         }
-        tokio::time::sleep(nack_delay + Duration::from_millis(50)).await;
+        let wait = policy.delay_for_attempt(total as u32) + Duration::from_millis(40);
+        tokio::time::sleep(wait).await;
     }
     assert_eq!(total, 3, "three attempts then terminal");
 

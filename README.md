@@ -21,8 +21,10 @@ a universal CLI that runs arbitrary remote code.
 - **`App`**: `register` / `send` / `run_worker` / `get_result`
   - optional `with_result_backend`, `with_default_queue`
   - `broker()` for shared broker access / advanced raw `Job` enqueue
-  - worker policy: `with_lease` (default **30s**), `with_max_attempts` (default **3**),
-    `with_nack_delay` (default **5s**), `with_concurrency` (default **4**)
+  - worker policy: `with_lease` (default **30s**), `with_concurrency` (default **4**),
+    `RetryPolicy` via `with_retry_policy` (defaults: **max_attempts 3**, **base_delay 1s**,
+    **max_delay 15m**, **equal jitter** on);
+    convenience: `with_max_attempts`, `with_nack_delay` (sets `base_delay` only)
 - **`MemoryBroker`** + optional **`MemoryResultBackend`**
   - **Single-process only** — not shared across OS processes; not a distributed queue
 - Optional **`RedisBroker`** + **`RedisResultBackend`** (`redis` feature)
@@ -31,7 +33,8 @@ a universal CLI that runs arbitrary remote code.
   - results as `{prefix}result:{id}` STRING JSON with **24h TTL**
 - Worker concurrency: Tokio tasks limited by a semaphore (default **4**)
 - Worker retry policy: task `Err` / panic → store Failure →
-  `nack(RequeueAfter)` until `max_attempts`, then terminal `ack`
+  `nack(RequeueAfter)` with **exponential backoff + equal jitter** until
+  `max_attempts`, then terminal `ack`
   (unknown task name is always terminal; lost-lease settle is non-fatal)
 - Claim-scoped ownership: each claim issues a `ClaimToken` required by `ack`/`nack`
 - Panic isolation at the task boundary (worker keeps going)
@@ -66,7 +69,7 @@ Producer and worker are separate OS processes that share Redis:
 1. Both connect with the **same** `RedisConfig` (`url` + `prefix`).
 2. Producer: `RedisBroker` (+ optional `RedisResultBackend` if it will call `get_result`).
 3. Worker: same `RedisBroker` + same `RedisResultBackend`, `register` the same task types, then `run_worker` (or a long-running loop around it).
-4. At-least-once delivery: a crashed worker’s claim expires (default lease **30s**); **recover-on-claim** requeues the job. Tasks should be **idempotent**. Failures retry with `nack` delay (default **5s**) up to `max_attempts` (default **3**); panics count as failures.
+4. At-least-once delivery: a crashed worker’s claim expires (default lease **30s**); **recover-on-claim** requeues the job. Tasks should be **idempotent**. Failures retry with exponential `nack` delay (`RetryPolicy`: base **1s**, max **15m**, equal jitter) up to `max_attempts` (default **3**); panics count as failures.
 
 ```rust
 // Producer process
@@ -90,7 +93,7 @@ app.run_worker(None).await?;
 
 ## Not yet
 
-- DLQ / exponential backoff (M2)
+- DLQ / terminal-only Failure storage (M2)
 - Proc-macro or `app.task("name", fn)` sugar
 - crates.io publish (`publish = false` until then)
 

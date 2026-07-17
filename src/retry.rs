@@ -13,8 +13,11 @@
 //! ```
 //!
 //! - When `jitter` is **false**, the delay is exactly `raw`.
-//! - When `jitter` is **true** (default), **equal jitter** is applied:
-//!   `raw/2 + random(0..=raw/2)`, so the result lies in `[raw/2, raw]`.
+//! - When `jitter` is **true** (default), **equal jitter** is applied using
+//!   integer nanosecond math: `half = floor(raw/2)`, then
+//!   `half + random(0..=half)`. The result lies in
+//!   `[floor(raw/2), 2*floor(raw/2)]` ⊆ `[raw/2, raw]`. The upper bound equals
+//!   `raw` when `raw` is even in nanoseconds; when odd it is `raw - 1ns`.
 //!
 //! Attempt `0` is treated like attempt `1` (no panic). Large attempt values
 //! saturate rather than overflow or panic; the delay is still capped by
@@ -39,7 +42,8 @@ pub struct RetryPolicy {
     pub base_delay: Duration,
     /// Hard cap on the raw exponential delay (default 15 minutes).
     pub max_delay: Duration,
-    /// When true, apply equal jitter so delay ∈ `[raw/2, raw]` (default true).
+    /// When true, apply equal jitter so delay ∈
+    /// `[floor(raw/2), 2*floor(raw/2)]` ⊆ `[raw/2, raw]` (default true).
     pub jitter: bool,
 }
 
@@ -64,14 +68,14 @@ impl RetryPolicy {
     /// - Does not panic for `attempt == 0` or very large `attempt`
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
         let exp = attempt.saturating_sub(1);
-        let raw = saturating_mul_pow2(self.base_delay, exp);
-        let raw = min_duration(raw, self.max_delay);
+        let raw = saturating_mul_pow2(self.base_delay, exp).min(self.max_delay);
 
         if !self.jitter || raw.is_zero() {
             return raw;
         }
 
-        // Equal jitter: raw/2 + U(0..=raw/2) → [raw/2, raw]
+        // Equal jitter: half + U(0..=half) where half = floor(raw/2).
+        // Range: [half, 2*half] ⊆ [raw/2, raw] (equals raw only when raw even in ns).
         let half = raw / 2;
         let half_nanos = duration_as_nanos_u64(half);
         let extra = if half_nanos == 0 {
@@ -98,10 +102,6 @@ fn saturating_mul_pow2(base: Duration, exp: u32) -> Duration {
         Some(n) if n <= u64::MAX as u128 => Duration::from_nanos(n as u64),
         _ => Duration::MAX,
     }
-}
-
-fn min_duration(a: Duration, b: Duration) -> Duration {
-    if a <= b { a } else { b }
 }
 
 fn duration_as_nanos_u64(d: Duration) -> u64 {
