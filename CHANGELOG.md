@@ -7,34 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### M2 reliability suite (complete)
+
+End-to-end reliability for the library shape: shared **RetryPolicy**, per-queue **DLQ**,
+**terminal-only Failure**, producer **idempotency_key**, and explicit **delivery guarantees**
+docs. Behavior remains **at-least-once** (lease + recover-on-claim may redeliver); tasks
+should be **idempotent**. Optional result backend → fire-and-forget when unset.
+
 ### Added
 
-- **Producer idempotency key**: optional `Job.idempotency_key` (`#[serde(default)]`) and
-  `App::send_with_idempotency_key`. On enqueue with a key, Memory/Redis return the existing
-  `JobId` if the key was already seen (no duplicate queue entry). Redis uses
-  `{prefix}idempotency:{key}` SET NX (Lua: job body SET first, then NX, then LPUSH;
-  NX loss deletes the orphan body). Keys are global per broker/prefix (caller should
-  namespace by task/queue when needed). Empty/whitespace keys → `EmptyIdempotencyKey`.
-  **At-least-once still applies** for in-flight worker crashes — the key is for safe
-  producer retries only.
+#### Documentation (M2-4)
+
+- README section **Delivery guarantees & failure modes**: at-least-once, terminal Failure
+  only, DLQ `list_dead` (no replay), producer `idempotency_key` scope, `RetryPolicy`
+  defaults, optional results / fire-and-forget.
+- [`docs/guarantees.md`](docs/guarantees.md): architecture decision notes aligned with
+  actual APIs (`Broker`, `RetryPolicy`, `JobResult`, claim tokens).
+
+#### Producer idempotency (M2-3)
+
+- Optional `Job.idempotency_key` (`#[serde(default)]`) and `App::send_with_idempotency_key`.
+  On enqueue with a key, Memory/Redis return the existing `JobId` if the key was already
+  seen (no duplicate queue entry). Redis uses `{prefix}idempotency:{key}` SET NX (Lua: job
+  body SET first, then NX, then LPUSH; NX loss deletes the orphan body). Keys are global
+  per broker/prefix (caller should namespace by task/queue when needed). Empty/whitespace
+  keys → `EmptyIdempotencyKey`. **At-least-once still applies** for in-flight worker
+  crashes — the key is for safe producer retries only.
+
+#### Dead-letter + terminal Failure (M2-2)
+
 - **Per-queue dead-letter queue (DLQ)**: `Broker::dead_letter(id, claim_token, reason)` and
   `Broker::list_dead(queue)` (inspect only; **no replay** in M2). Job body retained.
   - Memory: in-process per-queue dead list with reason.
   - Redis: `{prefix}q:{queue}:dead` LIST of job ids; `{prefix}job:{id}:dead_reason`; job body kept (no TTL in M2).
 - Public type `DeadLetter { job, reason }`.
+
+#### RetryPolicy (M2-1)
+
 - **`RetryPolicy`** (shared across Memory/Redis worker paths): exponential backoff with optional
   **equal jitter**. Defaults: `max_attempts` **3**, `base_delay` **1s**, `max_delay` **15m**,
   `jitter` **true**. Worker nack delay is `delay_for_attempt(job.attempts)`.
 - `App::with_retry_policy`; `with_max_attempts` / `with_nack_delay` remain as convenience
   mutators (`with_nack_delay` sets `base_delay` only).
 - Public defaults: `DEFAULT_MAX_ATTEMPTS`, `DEFAULT_BASE_DELAY`, `DEFAULT_MAX_DELAY`.
+
+#### M1 and earlier (retained)
+
 - **`RedisResultBackend`** (`redis` feature): `{prefix}result:{id}` STRING JSON `JobResult`,
   default TTL **24h** (`EX 86400`); shares [`RedisConfig`] with the broker.
 - `CapivaraError::ResultBackend` for result-backend I/O (distinct from `Broker`).
 - Worker **concurrency** via Tokio `Semaphore` (default **4**); `App::with_concurrency` (clamped ≥ 1).
 - Redis integration: full roundtrip with `RedisBroker` + `RedisResultBackend`; concurrency smoke.
 - Memory concurrency smoke test (several jobs with concurrency 4).
-- README multi-process notes (producer + worker, same prefix) and at-least-once / idempotency guidance.
+- README multi-process notes (producer + worker, same prefix).
 - Lease **recover-on-claim** for `RedisBroker` (Lua) and `MemoryBroker` (expired `in_flight` → pending).
 - **Claim tokens**: lease member `{queue}\x1f{id}\x1f{token}`; `ack`/`nack`/`dead_letter` require matching token so late settle cannot steal a reclaimed claim.
 - Redis claim **atomically INCRs** `{prefix}attempts:{id}` with lease (attempt counter independent of body JSON).
@@ -50,7 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Worker panic isolation via `tokio::spawn` join errors.
 - Integration tests for success, task error, panic isolation, missing result backend,
   bad JSON payload, `max_jobs`, `ResultNotFound`, fire-and-forget drain, unknown task name,
-  DLQ / terminal-only Failure, retry-then-success, and `with_default_queue`.
+  DLQ / terminal-only Failure, retry-then-success, producer idempotency, and `with_default_queue`.
 - `App::broker()` for shared broker access (tests / raw `Job` injection).
 - Repository skeleton: dual MIT OR Apache-2.0 license, README (WIP), security policy,
   contributing guide, GitHub Actions CI (fmt, clippy, test), Dependabot config.
@@ -68,3 +93,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Redis lease ZSET members use `{queue}\x1f{id}\x1f{token}`; delayed remains `{queue}\x1f{id}`.
 - Package version set to **`0.0.1`** with **`publish = false`** until a real release.
 - Apache-2.0 license appendix copyright filled in for Duarte Mainart Tecnologia e Publicidade LTDA.
+- README status marks **M2 complete** for the reliability suite; multi-process notes cross-link
+  the guarantees section instead of duplicating policy text.
