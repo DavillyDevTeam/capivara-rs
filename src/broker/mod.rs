@@ -3,6 +3,9 @@
 //! Celery analogy: Kombu / Redis transport.
 //! - M0/default: [`memory::MemoryBroker`] (single-process).
 //! - Feature `redis`: [`redis_broker::RedisBroker`] (multi-process capable).
+//!
+//! Terminal failures go to a **per-queue dead-letter list** via
+//! [`Broker::dead_letter`] (job body retained for inspect; no replay in M2).
 
 mod memory;
 #[cfg(feature = "redis")]
@@ -19,8 +22,9 @@ use std::fmt;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Opaque claim / delivery token. Ack and nack must present the token issued
-/// at claim time so a late settle cannot steal a newer claim after lease recovery.
+/// Opaque claim / delivery token. Ack, nack, and dead_letter must present the
+/// token issued at claim time so a late settle cannot steal a newer claim after
+/// lease recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ClaimToken(Uuid);
 
@@ -52,11 +56,12 @@ impl fmt::Display for ClaimToken {
 #[derive(Debug, Clone)]
 pub struct ClaimedJob {
     pub job: Job,
-    /// Must be passed to [`Broker::ack`] / [`Broker::nack`] for this claim.
+    /// Must be passed to [`Broker::ack`] / [`Broker::nack`] /
+    /// [`Broker::dead_letter`] for this claim.
     pub claim_token: ClaimToken,
 }
 
-/// What to do when a worker cannot complete a job (M1: delayed requeue).
+/// What to do when a worker cannot complete a job (delayed requeue).
 #[derive(Debug, Clone)]
 pub enum NackAction {
     /// Put the job aside until `delay` elapses, then make it claimable again.
@@ -64,6 +69,15 @@ pub enum NackAction {
     /// Both Redis and Memory honor `delay` (Memory uses an in-process delayed
     /// list; Redis uses a delayed ZSET promoted on claim).
     RequeueAfter { delay: Duration },
+}
+
+/// A job that was dead-lettered (terminal failure or unknown task).
+///
+/// Job body is retained for inspectability. There is **no replay API** in M2.
+#[derive(Debug, Clone)]
+pub struct DeadLetter {
+    pub job: Job,
+    pub reason: String,
 }
 
 /// Transport for job messages.
@@ -85,7 +99,7 @@ pub trait Broker: Send + Sync {
     /// due delayed jobs, then try to claim.
     ///
     /// The returned [`ClaimedJob::claim_token`] must be used for subsequent
-    /// `ack` / `nack` of this claim.
+    /// `ack` / `nack` / `dead_letter` of this claim.
     async fn claim(
         &self,
         queues: &[QueueName],
@@ -93,15 +107,26 @@ pub trait Broker: Send + Sync {
         block_for: Duration,
     ) -> Result<Option<ClaimedJob>>;
 
-    /// Complete this claim attempt: drop the lease / in-flight entry.
+    /// Complete this claim attempt successfully: drop the lease / in-flight entry
+    /// and discard the job body (Redis) / remove in-flight (Memory).
     ///
-    /// Does **not** imply the task handler succeeded — the worker may `ack`
-    /// after storing a failure result when attempts are exhausted (or for
-    /// unknown tasks). Succeeds only when `claim_token` matches the active claim.
+    /// Used after a successful task handler. Terminal failures use
+    /// [`Broker::dead_letter`] instead (which also clears the claim). Succeeds
+    /// only when `claim_token` matches the active claim.
     async fn ack(&self, id: &JobId, claim_token: &ClaimToken) -> Result<()>;
 
-    /// Negative-ack: requeue according to `action` (no DLQ in M1).
+    /// Negative-ack: requeue according to `action` (retry path; not terminal).
     ///
     /// Succeeds only when `claim_token` matches the active claim.
     async fn nack(&self, id: &JobId, claim_token: &ClaimToken, action: NackAction) -> Result<()>;
+
+    /// Move a claimed job to the per-queue dead-letter list and clear the claim.
+    ///
+    /// Keeps the job body for inspect via [`Broker::list_dead`]. `reason` is a
+    /// short human-readable cause (e.g. max attempts exhausted, unknown task).
+    /// Succeeds only when `claim_token` matches the active claim.
+    async fn dead_letter(&self, id: &JobId, claim_token: &ClaimToken, reason: &str) -> Result<()>;
+
+    /// List dead-lettered jobs for `queue` (oldest first). Inspect-only; no replay.
+    async fn list_dead(&self, queue: &QueueName) -> Result<Vec<DeadLetter>>;
 }

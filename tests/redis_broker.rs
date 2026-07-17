@@ -437,7 +437,7 @@ impl Task for AlwaysFails {
 }
 
 #[tokio::test]
-async fn redis_worker_retries_then_terminal() {
+async fn redis_worker_retries_then_dead_letter_terminal_only() {
     let (_guard, url) = redis_url().await;
     let broker = RedisBroker::connect(RedisConfig::new(url).with_prefix("capivara_retry:"))
         .await
@@ -467,6 +467,13 @@ async fn redis_worker_retries_then_terminal() {
     let mut total = 0usize;
     while total < 3 && std::time::Instant::now() < deadline {
         total += app.run_worker(None).await.unwrap();
+        if total < 3 {
+            let err = app.get_result(id).await.unwrap_err();
+            assert!(
+                matches!(err, CapivaraError::ResultNotFound { .. }),
+                "intermediate attempt {total} must not store Failure: {err:?}"
+            );
+        }
         if total >= 3 {
             break;
         }
@@ -480,7 +487,7 @@ async fn redis_worker_retries_then_terminal() {
         JobResult::Success { .. } => panic!("expected failure"),
     }
 
-    // Not claimable after terminal ack.
+    // Not claimable after terminal dead-letter; body retained on DLQ.
     let none = app
         .broker()
         .claim(
@@ -491,4 +498,57 @@ async fn redis_worker_retries_then_terminal() {
         .await
         .unwrap();
     assert!(none.is_none());
+
+    let dead = app.broker().list_dead(&QueueName::default()).await.unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].job.id, id);
+    assert!(dead[0].reason.contains("always fails"));
+}
+
+#[tokio::test]
+async fn redis_dead_letter_keeps_job_body_for_inspect() {
+    let (_guard, url) = redis_url().await;
+    let broker = RedisBroker::connect(RedisConfig::new(url).with_prefix("capivara_dlq:"))
+        .await
+        .unwrap();
+
+    let mut job = Job::new("ping", br#"{"msg":"dead"}"#.to_vec());
+    job.queue = QueueName::default();
+    let id = broker.enqueue(job).await.unwrap();
+
+    let claimed = broker
+        .claim(
+            &[QueueName::default()],
+            Duration::from_secs(30),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap()
+        .expect("claim");
+    assert_eq!(claimed.job.id, id);
+
+    broker
+        .dead_letter(&id, &claimed.claim_token, "manual poison")
+        .await
+        .unwrap();
+
+    let dead = broker.list_dead(&QueueName::default()).await.unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].job.id, id);
+    assert_eq!(dead[0].job.task_name, "ping");
+    assert_eq!(dead[0].reason, "manual poison");
+    assert_eq!(dead[0].job.payload, br#"{"msg":"dead"}"#);
+
+    // Not reclaimable from pending.
+    assert!(
+        broker
+            .claim(
+                &[QueueName::default()],
+                Duration::from_secs(30),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

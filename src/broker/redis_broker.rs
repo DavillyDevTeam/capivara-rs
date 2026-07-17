@@ -5,17 +5,19 @@
 //! # Key layout (prefix configurable)
 //!
 //! - `{prefix}q:{queue}:pending` — LIST of job id strings (ready)
-//! - `{prefix}job:{id}` — STRING JSON [`Job`]
+//! - `{prefix}q:{queue}:dead` — LIST of job id strings (dead-lettered; no TTL in M2)
+//! - `{prefix}job:{id}` — STRING JSON [`Job`] (kept after dead-letter for inspect)
+//! - `{prefix}job:{id}:dead_reason` — STRING reason when dead-lettered
 //! - `{prefix}attempts:{id}` — STRING integer attempt counter (INCR on claim)
 //! - `{prefix}lease` — ZSET score = lease expiry (unix ms),
 //!   member = `{queue}\x1f{id}\x1f{token}`
 //! - `{prefix}delayed` — ZSET score = available_at (unix ms), member = `{queue}\x1f{id}`
 //!
-//! Claim / promote / recover / ack paths use **Lua** so multi-worker races cannot
-//! double-enqueue or delete unowned job bodies. Claim tokens ensure late
-//! ack/nack after recover cannot steal a newer claim.
+//! Claim / promote / recover / ack / dead_letter paths use **Lua** so multi-worker
+//! races cannot double-enqueue or delete unowned job bodies. Claim tokens ensure
+//! late ack/nack/dead_letter after recover cannot steal a newer claim.
 
-use crate::broker::{Broker, ClaimToken, ClaimedJob, NackAction};
+use crate::broker::{Broker, ClaimToken, ClaimedJob, DeadLetter, NackAction};
 use crate::error::{CapivaraError, Result};
 use crate::job::{Job, JobId, QueueName};
 use async_trait::async_trait;
@@ -54,6 +56,8 @@ pub struct RedisBroker {
     claim_script: Script,
     ack_script: Script,
     nack_script: Script,
+    /// Drop lease, push id onto dead list, store reason, drop attempts; keep job body.
+    dead_letter_script: Script,
     /// Atomically: for each due delayed member, ZREM then LPUSH only if we won ZREM.
     promote_script: Script,
     /// Atomically: for each expired lease member, ZREM then LPUSH only if we won ZREM.
@@ -127,6 +131,27 @@ impl RedisBroker {
             else
               redis.call('ZADD', KEYS[2], ARGV[4], ARGV[5])
             end
+            return 1
+            "#,
+        );
+
+        // KEYS[1]=lease, KEYS[2]=dead list
+        // ARGV[1]=job key, ARGV[2]=lease member, ARGV[3]=job id,
+        // ARGV[4]=reason key, ARGV[5]=reason, ARGV[6]=attempts key
+        // Clears claim, appends to dead list, stores reason; keeps job body.
+        let dead_letter_script = Script::new(
+            r#"
+            local removed = redis.call('ZREM', KEYS[1], ARGV[2])
+            if removed == 0 then
+              return 0
+            end
+            local body = redis.call('GET', ARGV[1])
+            if not body then
+              return 0
+            end
+            redis.call('LPUSH', KEYS[2], ARGV[3])
+            redis.call('SET', ARGV[4], ARGV[5])
+            redis.call('DEL', ARGV[6])
             return 1
             "#,
         );
@@ -206,6 +231,7 @@ impl RedisBroker {
             claim_script,
             ack_script,
             nack_script,
+            dead_letter_script,
             promote_script,
             recover_script,
         })
@@ -213,6 +239,10 @@ impl RedisBroker {
 
     fn pending_key(&self, queue: &str) -> String {
         format!("{}q:{}:pending", self.prefix, queue)
+    }
+
+    fn dead_key(&self, queue: &str) -> String {
+        format!("{}q:{}:dead", self.prefix, queue)
     }
 
     fn pending_key_prefix(&self) -> String {
@@ -225,6 +255,10 @@ impl RedisBroker {
 
     fn job_key_prefix(&self) -> String {
         format!("{}job:", self.prefix)
+    }
+
+    fn dead_reason_key(&self, id: &JobId) -> String {
+        format!("{}job:{}:dead_reason", self.prefix, id)
     }
 
     fn attempts_key(&self, id: &JobId) -> String {
@@ -479,5 +513,67 @@ impl Broker for RedisBroker {
             }
         }
         Ok(())
+    }
+
+    async fn dead_letter(&self, id: &JobId, claim_token: &ClaimToken, reason: &str) -> Result<()> {
+        let job = self.get_job(id).await?;
+        let lease_member = Self::lease_member(job.queue.as_str(), id, claim_token);
+        let dead = self.dead_key(job.queue.as_str());
+        let mut conn = self.conn.clone();
+        let ok: i32 = self
+            .dead_letter_script
+            .key(self.lease_key())
+            .key(&dead)
+            .arg(self.job_key(id))
+            .arg(&lease_member)
+            .arg(id.to_string())
+            .arg(self.dead_reason_key(id))
+            .arg(reason)
+            .arg(self.attempts_key(id))
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| CapivaraError::Broker(e.to_string()))?;
+        if ok == 0 {
+            return Err(CapivaraError::JobNotFound { id: id.to_string() });
+        }
+        Ok(())
+    }
+
+    async fn list_dead(&self, queue: &QueueName) -> Result<Vec<DeadLetter>> {
+        let mut conn = self.conn.clone();
+        let dead = self.dead_key(queue.as_str());
+        // Dead list uses LPUSH (newest at head); reverse so oldest is first.
+        let ids: Vec<String> = redis::cmd("LRANGE")
+            .arg(&dead)
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| CapivaraError::Broker(e.to_string()))?;
+
+        let mut out = Vec::with_capacity(ids.len());
+        for id_str in ids.into_iter().rev() {
+            let id = JobId(uuid::Uuid::parse_str(&id_str).map_err(|e| {
+                CapivaraError::Broker(format!("invalid dead-letter job id {id_str}: {e}"))
+            })?);
+            let body: Option<String> = redis::cmd("GET")
+                .arg(self.job_key(&id))
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| CapivaraError::Broker(e.to_string()))?;
+            let Some(body) = body else {
+                // Orphan dead id without body — skip but keep listing others.
+                continue;
+            };
+            let job: Job = serde_json::from_str(&body)?;
+            let reason: String = redis::cmd("GET")
+                .arg(self.dead_reason_key(&id))
+                .query_async::<Option<String>>(&mut conn)
+                .await
+                .map_err(|e| CapivaraError::Broker(e.to_string()))?
+                .unwrap_or_default();
+            out.push(DeadLetter { job, reason });
+        }
+        Ok(out)
     }
 }
