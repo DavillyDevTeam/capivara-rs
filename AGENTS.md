@@ -16,6 +16,8 @@ src/
   lib.rs app.rs job.rs error.rs task.rs registry.rs metrics.rs
   metrics_http.rs   # behind feature metrics-http
   broker/  result/  worker/
+docs/
+  ARCHITECTURE.md  guarantees.md
 tests/
   memory_roundtrip.rs  metrics_record.rs  metrics_http.rs (feature metrics-http)
 ```

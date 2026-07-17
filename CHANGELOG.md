@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### M3 observability suite (complete)
+
+End-to-end observability for the library shape: **`tracing`** spans on lifecycle paths,
+Prometheus-ready **`metrics`** facade counters/histograms, and an optional **`metrics-http`**
+scrape endpoint. Architecture + failure-mode docs close the milestone. Package remains
+**`0.0.1`** with **`publish = false`**.
+
+**Release note:** discuss a formal **`0.1.0`** crates.io release **with the maintainer**
+before publishing. Do not flip `publish = true` or bump to 0.1.0 unilaterally after M3.
+
 ### Added
+
+#### Architecture + observability docs (M3-4)
+
+- README **Architecture** mermaid (producer → Memory/Redis broker → worker → optional results).
+- README **Failure modes in 10 minutes**: lease-expire double-run, intermediate
+  `ResultNotFound`, DLQ inspect-only, metrics `status=dead` vs `failure`.
+- README **Observability** how-to: tracing subscriber + `RUST_LOG`; metrics table;
+  `metrics-http` `serve` / `start_metrics_server` snippet and security notes.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): topology, components, claim/lease
+  sequence, observability surfaces, non-goals.
+- Status line marks **M3 complete**.
 
 #### Prometheus scrape endpoint (M3-3)
 
@@ -131,3 +152,5 @@ should be **idempotent**. Optional result backend → fire-and-forget when unset
 - Apache-2.0 license appendix copyright filled in for Duarte Mainart Tecnologia e Publicidade LTDA.
 - README status marks **M2 complete** for the reliability suite; multi-process notes cross-link
   the guarantees section instead of duplicating policy text.
+- README status marks **M3 complete** for the observability suite (tracing, metrics facade,
+  optional scrape) and links architecture / failure-mode docs.
