@@ -6,9 +6,10 @@ matches or **explicitly opts out of**. Delivery promises (at-least-once, claim
 tokens, terminal Failure) live in [guarantees.md](guarantees.md); structural
 topology lives in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-**Milestone context:** M0–M3 shipped Memory + Redis end-to-end. **M4** freezes this
-matrix and lands an **experimental** Rabbit spike (`rabbitmq` feature). **Kafka is
-not planned.**
+**Milestone context:** M0–M3 shipped Memory + Redis end-to-end. **M4 is complete**:
+this matrix is frozen, an **experimental** Rabbit spike shipped (`rabbitmq` feature),
+and SyncTask DX landed (see README). **Kafka is not planned.** Package remains
+**`0.0.1`** / **`publish = false`** (post-M3 **0.1.0** discussion still open).
 
 ---
 

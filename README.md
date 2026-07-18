@@ -13,7 +13,7 @@ a universal CLI that runs arbitrary remote code.
 | **Package** | `capivara` (repo: [`capivara-rs`](https://github.com/DavillyDevTeam/capivara-rs)) |
 | **Org** | [DavillyDevTeam](https://github.com/DavillyDevTeam) |
 | **License** | MIT OR Apache-2.0 |
-| **Status** | **M3 complete**; M4 multi-broker path (Broker matrix + experimental RabbitMQ spike); Memory + Redis + experimental Rabbit |
+| **Status** | **M3 + M4 complete** — reliability, observability, multi-broker path (Memory + Redis + experimental Rabbit), `SyncTask` DX. Still **`0.0.1`** / **`publish = false`** |
 
 ## Architecture
 
@@ -52,25 +52,32 @@ flowchart LR
   P -.->|get_result| RR
 ```
 
+### Capability snapshot (Memory / Redis / Rabbit)
+
 | | Memory (default) | Redis (`redis` feature) | RabbitMQ (`rabbitmq`, **experimental**) |
 |---|---|---|---|
 | **Process model** | Single process only | Multi-process (shared `url` + `prefix`) | Multi-process (shared AMQP URL + prefix) |
 | **Broker** | `MemoryBroker` | `RedisBroker` (LIST + lease, Lua) | `RabbitBroker` (lapin; **no** timed lease) |
-| **Results** | `MemoryResultBackend` | `RedisResultBackend` (JSON STRING, 24h TTL) | Use Memory/Redis results; no Rabbit result backend |
-| **Use** | Unit tests, in-process apps | Producers + workers across machines | Spike / multi-worker experiments only |
+| **Results** | `MemoryResultBackend` | `RedisResultBackend` (JSON STRING, 24h TTL) | Pair with Memory/Redis results — **no** Rabbit result backend |
+| **Lease / recover-on-claim** | **yes** | **yes** | **no** (`lease` ignored; redelivery on channel/connection drop) |
+| **Claim tokens** | **yes** | **yes** (ZSET member) | **partial** (process-local delivery ownership) |
+| **Delayed nack / DLQ / `list_dead`** | **yes** | **yes** | **partial / spike** (TTL+DLX hop; best-effort `list_dead`) |
+| **Producer `idempotency_key`** | **yes** (in-process map) | **yes** (Redis SET NX) | **partial** (process-local only) |
+| **Queue-depth metric** | **yes** (pending length) | **no** on hot path | **no** on hot path |
+| **Use** | Unit tests, in-process apps | Producers + workers across machines | Spike / multi-worker experiments only — **not** production |
+
+**Kafka is not planned.** Full trait checklist, settle rules, and Rabbit gap list:
+[docs/BROKER.md](docs/BROKER.md).
 
 Omit a result backend for **fire-and-forget**. Delivery is **at-least-once** — see guarantees below.
 
-**Broker capability matrix** (enqueue, claim+block, lease/recover, delayed nack, DLQ,
-`list_dead`, producer idempotency — Memory vs Redis vs experimental Rabbit; Kafka not planned):
-[docs/BROKER.md](docs/BROKER.md).
-
-## What works today (M0–M4 partial)
+## What works today (M0–M4)
 
 - Typed **`Task`** trait (`NAME`, `Args`, `Output`, native async `run`)
 - **Sync / blocking handlers** — [`SyncTask`](src/task_sync.rs) (blanket `Task` via
   `spawn_blocking`) and [`run_blocking`](src/task_sync.rs) for hybrid async bodies;
   see [Blocking / sync tasks](#blocking--sync-tasks) and `examples/sync_task.rs`
+  (**no** `#[task]` proc-macro — optional M4-4 was skipped)
 - **`App`**: `register` / `send` / `send_with_idempotency_key` / `run_worker` / `get_result`
   - optional `with_result_backend`, `with_default_queue`
   - `broker()` for shared broker access / advanced raw `Job` enqueue
@@ -84,6 +91,8 @@ Omit a result backend for **fire-and-forget**. Delivery is **at-least-once** —
   - LIST + lease, Lua claim/ack/nack/dead_letter, delayed requeue
   - **lease recover-on-claim**, **claim tokens** (late ack/nack/dead_letter cannot steal a newer claim)
   - results as `{prefix}result:{id}` STRING JSON with **24h TTL**
+- Optional experimental **`RabbitBroker`** (`rabbitmq` feature) — not Redis parity;
+  see [docs/BROKER.md](docs/BROKER.md)
 - Worker concurrency: Tokio tasks limited by a semaphore (default **4**)
 - Claim-scoped ownership: each claim issues a `ClaimToken` required by `ack`/`nack`/`dead_letter`
 - Panic isolation at the task boundary (worker keeps going)
@@ -375,16 +384,19 @@ cargo test --features metrics-http
 - **v0 security:** no authentication. Keep loopback or isolate the scrape network;
   put TLS/auth at a reverse proxy if you expose it.
 
-## Not yet
+## Not yet / version posture
 
 - **RabbitMQ production polish** — experimental `RabbitBroker` exists (`rabbitmq` feature)
   but is **not** Redis parity (no timed lease/recover, process-local claim tokens /
   idempotency, best-effort `list_dead`); see [docs/BROKER.md](docs/BROKER.md)
 - **Kafka** is **not planned**
 - DLQ replay / redrive API
-- Proc-macro or `app.task("name", fn)` sugar
-- crates.io publish — stay at **`0.0.1`** / **`publish = false`** until the maintainer
-  agrees a **`0.1.0`** release (discuss after M3; do not publish unilaterally)
+- **`#[task]` proc-macro / `app.task("name", fn)` sugar** — **not shipped** (optional M4-4
+  skipped). Use typed [`Task`](src/task.rs) or [`SyncTask`](src/task_sync.rs) instead.
+- **crates.io** — package stays **`0.0.1`** with **`publish = false`**. A formal **`0.1.0`**
+  cut was flagged for discussion **after M3** and remains **open** (no unilateral
+  `publish = true`, version bump, or crates.io publish). Discuss with the maintainer
+  before any release decision (including post-M4 0.1.x vs 0.2.0).
 
 ## Blocking / sync tasks
 
@@ -392,7 +404,7 @@ Workers run on Tokio. **Do not** call `std::thread::sleep`, blocking `std::fs`, 
 heavy CPU loops directly inside `async fn Task::run` — that stalls the runtime and
 hurts concurrency.
 
-Two DX helpers (no proc-macro):
+Two DX helpers (no proc-macro — `#[task]` was **not** shipped):
 
 | Helper | When to use |
 |---|---|
@@ -426,7 +438,19 @@ impl SyncTask for BlockingWork {
 // app.send::<BlockingWork>(&WorkArgs { n: 100 }).await?;
 ```
 
-Full runnable sample: `cargo run --example sync_task`.
+Hybrid async handler (only the heavy part blocks the pool):
+
+```rust
+use capivara::{Task, TaskError, run_blocking};
+// inside impl Task for Hybrid:
+// async fn run(args: Self::Args) -> Result<Self::Output, TaskError> {
+//     let mid = prepare_async(&args).await?;
+//     run_blocking(|m| Ok(compute_sync(m)), mid).await
+// }
+```
+
+Full runnable sample: `cargo run --example sync_task`. Integration coverage:
+`tests/task_sync_roundtrip.rs`.
 
 **Note:** both `Task` and `SyncTask` expose `run`. To call the sync body directly,
 use UFCS: `<T as SyncTask>::run(args)`. Prefer `register` / `send` for normal use.

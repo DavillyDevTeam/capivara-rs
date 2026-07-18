@@ -7,12 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### M4 multi-broker path (in progress)
+### M4 multi-broker & DX suite (complete)
 
-Stabilize the shared `Broker` contract and land an **experimental** RabbitMQ spike.
-**Kafka is not planned.** Package remains **`0.0.1`** with **`publish = false`**.
+End-to-end multi-broker path for the library shape: frozen **Broker capability matrix**
+(Memory / Redis / experimental Rabbit), **experimental RabbitMQ** spike (`rabbitmq`
+feature), and **SyncTask / `run_blocking`** DX. Optional **`#[task]`** proc-macro
+(**M4-4**) was **skipped** — use typed `Task` / `SyncTask` instead. **Kafka is not
+planned.**
+
+**Version posture:** package remains **`0.0.1`** with **`publish = false`**. The
+post-M3 discussion of a formal **`0.1.0`** crates.io release is still **open** —
+do not flip `publish = true`, bump to 0.1.0 / 0.2.0, or publish unilaterally.
 
 ### Added
+
+#### Multi-broker DX docs (M4-5)
+
+- README **capability snapshot** table for Memory / Redis / experimental Rabbit
+  (lease, claim tokens, delayed nack/DLQ, producer idempotency, queue-depth metric)
+  plus pointer to full matrix in [`docs/BROKER.md`](docs/BROKER.md).
+- README **Blocking / sync tasks** DX (`SyncTask`, `run_blocking`, hybrid snippet);
+  explicit **no `#[task]` proc-macro** (M4-4 skipped).
+- README / CHANGELOG **version posture**: stay `0.0.1` / `publish = false`; `0.1.0`
+  discussion after M3 remains open.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) / [`docs/guarantees.md`](docs/guarantees.md)
+  aligned with final M4 code (Rabbit in topology, `task_sync`, Rabbit gap pointers).
+- Status lines mark **M4 complete**.
 
 #### Sync / blocking task bridge (M4-3)
 
@@ -205,3 +225,5 @@ should be **idempotent**. Optional result backend → fire-and-forget when unset
   the guarantees section instead of duplicating policy text.
 - README status marks **M3 complete** for the observability suite (tracing, metrics facade,
   optional scrape) and links architecture / failure-mode docs.
+- README status marks **M4 complete** for the multi-broker & DX suite (Broker matrix,
+  experimental RabbitMQ, `SyncTask` / `run_blocking`; no `#[task]` macro).

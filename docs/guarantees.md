@@ -1,6 +1,6 @@
 # Delivery guarantees & architecture notes
 
-This document records **what capivara promises today** (M0–M3; M4 multi-broker path)
+This document records **what capivara promises today** (M0–**M4 complete**)
 and the design decisions behind those promises. For a shorter operator-facing summary,
 see the README sections [Failure modes in 10 minutes](../README.md#failure-modes-in-10-minutes)
 and [Delivery guarantees & failure modes](../README.md#delivery-guarantees--failure-modes).
@@ -8,7 +8,14 @@ Structural map: [ARCHITECTURE.md](ARCHITECTURE.md). Broker capability matrix (Me
 Redis / experimental Rabbit `rabbitmq` feature): [BROKER.md](BROKER.md).
 
 APIs referenced: `App`, `Broker`, `RetryPolicy`, `JobResult`, `DeadLetter`,
-`ClaimToken`, `send_with_idempotency_key`.
+`ClaimToken`, `send_with_idempotency_key`, `SyncTask`, `run_blocking`.
+
+**Scope of the guarantees below:** the **Memory** and **Redis** backends meet the
+full lease / recover-on-claim / claim-token bar. The experimental **Rabbit** spike
+implements the `Broker` trait surface for a worker happy path but **opts out** of
+several rows (no timed lease, process-local tokens and `idempotency_key`,
+ack-then-republish settle crash window) — treat those sections as Memory/Redis
+truth and read [BROKER.md](BROKER.md) before relying on Rabbit.
 
 ---
 
@@ -117,6 +124,7 @@ redeliver and rewrite results (see §1 “Success store before ack”).
 |---|---|---|---|
 | Memory | In-process per-queue list | stored with entry | full `Job` |
 | Redis | `{prefix}q:{queue}:dead` LIST of ids | `{prefix}job:{id}:dead_reason` | job key retained (no TTL in M2) |
+| Rabbit (experimental) | `{prefix}{queue}:dead` AMQP queue | `x-capivara-dead-reason` header | JSON job body; `list_dead` best-effort |
 
 ### Why inspect-only first
 
@@ -156,6 +164,7 @@ Safe **producer** retries: client timeout, reconnect, “did my send land?”
 |---|---|
 | Memory | `HashMap<String, JobId>` under broker mutex |
 | Redis | `{prefix}idempotency:{key}` STRING, Lua job body SET first then SET NX + LPUSH; NX loss DEL orphan body |
+| Rabbit (experimental) | **Process-local** map only; recorded **after** successful publish — not multi-process safe ([BROKER.md](BROKER.md)) |
 
 ---
 
@@ -248,7 +257,13 @@ Do not treat metrics `failure` as permanent give-up; pair alerts on `dead` with
 - DLQ automatic replay.
 - Cross-process Memory broker.
 - Idempotency key TTL / eviction policy (M2: permanent map entry per key).
-- Unilateral crates.io publish — stay `publish = false` until maintainer agrees **0.1.0**.
+- **Kafka** broker (not planned).
+- Rabbit production readiness / Redis lease+idempotency parity (spike only).
+- **`#[task]` proc-macro** (optional M4-4 skipped; use `Task` / `SyncTask`).
+- Unilateral crates.io publish — stay **`0.0.1`** / **`publish = false`** until the
+  maintainer agrees a formal **0.1.0** (post-M3 discussion still open; no post-M4
+  unilateral 0.1.x / 0.2.0 either).
 
-When any of these change, update this file, [ARCHITECTURE.md](ARCHITECTURE.md), and
-the README guarantees section together so docs stay aligned with APIs.
+When any of these change, update this file, [ARCHITECTURE.md](ARCHITECTURE.md),
+[BROKER.md](BROKER.md), and the README guarantees section together so docs stay
+aligned with APIs.
