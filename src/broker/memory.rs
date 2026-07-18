@@ -81,15 +81,19 @@ impl MemoryBroker {
 #[async_trait]
 impl Broker for MemoryBroker {
     async fn enqueue(&self, job: Job) -> Result<JobId> {
+        if let Some(ref key) = job.idempotency_key {
+            if key.trim().is_empty() {
+                return Err(CapivaraError::EmptyIdempotencyKey);
+            }
+        }
         let mut guard = self.inner.lock().await;
         // Producer idempotency: same key → existing JobId, no second queue entry.
+        // Map insert + pending push are under one mutex (atomic for this process).
+        let id = job.id;
         if let Some(ref key) = job.idempotency_key {
             if let Some(existing) = guard.idempotency.get(key) {
                 return Ok(*existing);
             }
-        }
-        let id = job.id;
-        if let Some(ref key) = job.idempotency_key {
             guard.idempotency.insert(key.clone(), id);
         }
         let q = job.queue.as_str().to_string();

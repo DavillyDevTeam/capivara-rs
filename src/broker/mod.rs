@@ -91,6 +91,11 @@ pub trait Broker: Send + Sync {
     /// recorded, returns the **existing** [`JobId`] without creating a duplicate
     /// queue entry. This is for **safe producer retries** only: in-flight worker
     /// crashes still deliver at-least-once (tasks should remain idempotent).
+    ///
+    /// Keys are **global per broker instance / Redis prefix**, not namespaced by
+    /// task name or queue — include those in the key string when needed. Empty
+    /// or whitespace-only keys must return
+    /// [`crate::CapivaraError::EmptyIdempotencyKey`].
     async fn enqueue(&self, job: Job) -> Result<JobId>;
 
     /// Claim the next available job from any of `queues`.

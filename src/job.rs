@@ -73,6 +73,12 @@ pub struct Job {
     /// Optional producer-side dedupe key. When set on enqueue, the broker returns
     /// the existing [`JobId`] if the key was seen before (no duplicate queue entry).
     ///
+    /// Keys are **global per broker** (Memory process / Redis key `prefix`), not
+    /// namespaced by `task_name` or `queue`. Include the task name (and queue if
+    /// needed) in the key string when uniqueness must not collide across tasks.
+    /// Empty / whitespace-only keys are rejected with
+    /// [`crate::CapivaraError::EmptyIdempotencyKey`].
+    ///
     /// `#[serde(default)]` so older job JSON without this field deserializes as `None`.
     #[serde(default)]
     pub idempotency_key: Option<String>,

@@ -75,7 +75,7 @@ Producer and worker are separate OS processes that share Redis:
 2. Producer: `RedisBroker` (+ optional `RedisResultBackend` if it will call `get_result`).
 3. Worker: same `RedisBroker` + same `RedisResultBackend`, `register` the same task types, then `run_worker` (or a long-running loop around it).
 4. At-least-once delivery: a crashed worker’s claim expires (default lease **30s**); **recover-on-claim** requeues the job. Tasks should be **idempotent**. Failures retry with exponential `nack` delay (`RetryPolicy`: base **1s**, max **15m**, equal jitter) up to `max_attempts` (default **3**), then dead-letter; panics count as failures. Intermediate retries do not store `JobResult::Failure`.
-5. **Producer retries**: use `App::send_with_idempotency_key` (or set `Job.idempotency_key` on raw enqueue). The broker maps `key → JobId` (Memory: HashMap; Redis: `{prefix}idempotency:{key}` SET NX) and returns the existing id on collision. This does **not** cancel at-least-once worker redelivery after a crash mid-execution.
+5. **Producer retries**: use `App::send_with_idempotency_key` (or set `Job.idempotency_key` on raw enqueue). The broker maps `key → JobId` (Memory: HashMap; Redis: `{prefix}idempotency:{key}` SET NX, body-first Lua) and returns the existing id on collision. Keys are **global per broker prefix** — include task/queue in the key string when needed. Empty keys are rejected. This does **not** cancel at-least-once worker redelivery after a crash mid-execution.
 
 ```rust
 // Producer process

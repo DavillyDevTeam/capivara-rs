@@ -17,7 +17,9 @@
 //! Claim / promote / recover / ack / dead_letter paths use **Lua** so multi-worker
 //! races cannot double-enqueue or delete unowned job bodies. Claim tokens ensure
 //! late ack/nack/dead_letter after recover cannot steal a newer claim. Enqueue with
-//! an idempotency key uses Lua SET NX so concurrent producers cannot double-queue.
+//! an idempotency key uses Lua: **job body SET first**, then map SET NX, then LPUSH.
+//! On NX loss the orphan body is `DEL`'d and the winner id is returned — so a
+//! mid-script error cannot leave a map entry without a body (silent lost enqueue).
 
 use crate::broker::{Broker, ClaimToken, ClaimedJob, DeadLetter, NackAction};
 use crate::error::{CapivaraError, Result};
@@ -64,7 +66,7 @@ pub struct RedisBroker {
     promote_script: Script,
     /// Atomically: for each expired lease member, ZREM then LPUSH only if we won ZREM.
     recover_script: Script,
-    /// SET NX idempotency map; on win SET job body + LPUSH pending; on lose return existing id.
+    /// Body SET first, then SET NX map; on win LPUSH pending; on lose DEL orphan body + return winner.
     enqueue_idempotent_script: Script,
 }
 
@@ -231,14 +233,18 @@ impl RedisBroker {
 
         // KEYS[1]=idempotency key, KEYS[2]=job key, KEYS[3]=pending list
         // ARGV[1]=job id string, ARGV[2]=job body JSON
+        // Body first so a mid-script OOM/error after map NX cannot leave a map
+        // entry with no job body (producer retry would return that id → silent
+        // lost enqueue). On NX loss DEL the orphan body and return the winner.
         // Returns the winning job id (existing or newly enqueued).
         let enqueue_idempotent_script = Script::new(
             r#"
+            redis.call('SET', KEYS[2], ARGV[2])
             local set = redis.call('SET', KEYS[1], ARGV[1], 'NX')
             if not set then
+              redis.call('DEL', KEYS[2])
               return redis.call('GET', KEYS[1])
             end
-            redis.call('SET', KEYS[2], ARGV[2])
             redis.call('LPUSH', KEYS[3], ARGV[1])
             return ARGV[1]
             "#,
@@ -417,8 +423,11 @@ impl Broker for RedisBroker {
         let pending = self.pending_key(job.queue.as_str());
         let body = serde_json::to_string(&job)?;
 
-        // Producer idempotency: SET NX map key→job_id; return existing on collision.
+        // Producer idempotency: body first, then SET NX map; return existing on collision.
         if let Some(ref key) = job.idempotency_key {
+            if key.trim().is_empty() {
+                return Err(CapivaraError::EmptyIdempotencyKey);
+            }
             let idemp = self.idempotency_key(key);
             let returned: String = self
                 .enqueue_idempotent_script

@@ -123,12 +123,21 @@ impl App {
     /// **At-least-once still applies** for in-flight worker crashes: the key only
     /// dedupes producer-side retries, not worker redelivery after lease recovery.
     /// Tasks should still be written to tolerate duplicate execution.
+    ///
+    /// Keys are **global per broker** (not scoped by task name or queue). Callers
+    /// that need isolation should embed task/queue in the key string (e.g.
+    /// `"add:order-42"`). Empty / whitespace-only keys return
+    /// [`CapivaraError::EmptyIdempotencyKey`].
     pub async fn send_with_idempotency_key<T: Task>(
         &self,
         args: &T::Args,
         key: impl Into<String>,
     ) -> Result<JobId> {
-        self.send_inner::<T>(args, Some(key.into())).await
+        let key = key.into();
+        if key.trim().is_empty() {
+            return Err(CapivaraError::EmptyIdempotencyKey);
+        }
+        self.send_inner::<T>(args, Some(key)).await
     }
 
     async fn send_inner<T: Task>(

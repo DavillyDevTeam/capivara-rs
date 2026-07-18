@@ -799,6 +799,62 @@ async fn producer_idempotency_key_dedupes_double_enqueue() {
         }
         JobResult::Failure { message } => panic!("unexpected failure: {message}"),
     }
+
+    // Map still applies after the first job completed: same key → same id, no re-drive.
+    let id_after = app
+        .send_with_idempotency_key::<CountedAdd>(&args, "order-42")
+        .await
+        .unwrap();
+    assert_eq!(id_after, id1);
+    assert!(
+        app.broker()
+            .claim(
+                &[QueueName::default()],
+                Duration::from_secs(30),
+                Duration::ZERO
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "completed key must not re-queue a second pending job"
+    );
+    assert_eq!(
+        RUNS.load(Ordering::SeqCst),
+        2,
+        "post-complete resend must not re-run the handler"
+    );
+}
+
+#[tokio::test]
+async fn producer_idempotency_rejects_empty_key() {
+    let app = App::new(MemoryBroker::new());
+    app.register::<Add>().await.unwrap();
+    let args = AddArgs { x: 1, y: 2 };
+
+    let err = app
+        .send_with_idempotency_key::<Add>(&args, "")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CapivaraError::EmptyIdempotencyKey),
+        "empty key: {err}"
+    );
+
+    let err = app
+        .send_with_idempotency_key::<Add>(&args, "   ")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CapivaraError::EmptyIdempotencyKey),
+        "whitespace key: {err}"
+    );
+
+    // Raw broker path rejects too.
+    let broker = MemoryBroker::new();
+    let mut job = Job::new("add", br#"{"x":1,"y":2}"#.to_vec());
+    job.idempotency_key = Some("".into());
+    let err = broker.enqueue(job).await.unwrap_err();
+    assert!(matches!(err, CapivaraError::EmptyIdempotencyKey));
 }
 
 #[tokio::test]
