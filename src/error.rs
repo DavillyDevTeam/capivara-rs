@@ -23,6 +23,10 @@ pub enum CapivaraError {
     #[error("job `{id}` not found in broker")]
     JobNotFound { id: String },
 
+    /// Producer idempotency key was empty or whitespace-only.
+    #[error("idempotency key must be non-empty (got empty or whitespace-only)")]
+    EmptyIdempotencyKey,
+
     /// JSON encode/decode failure (name kept short; covers both directions).
     #[error("JSON serde error: {0}")]
     Serialize(#[from] serde_json::Error),

@@ -125,6 +125,51 @@ async fn redis_app_roundtrip_with_memory_results() {
 }
 
 #[tokio::test]
+async fn redis_producer_idempotency_key_dedupes() {
+    let (_guard, url) = redis_url().await;
+    let broker = RedisBroker::connect(RedisConfig::new(url).with_prefix("capivara_idemp:"))
+        .await
+        .unwrap();
+    let app = App::new(broker).with_result_backend(MemoryResultBackend::new());
+    app.register::<Ping>().await.unwrap();
+
+    let args = PingArgs { msg: "once".into() };
+    let id1 = app
+        .send_with_idempotency_key::<Ping>(&args, "invoice-7")
+        .await
+        .unwrap();
+    let id2 = app
+        .send_with_idempotency_key::<Ping>(&args, "invoice-7")
+        .await
+        .unwrap();
+    assert_eq!(id1, id2, "same key must return the same JobId");
+
+    let n = app.run_worker(None).await.unwrap();
+    assert_eq!(n, 1, "duplicate key must not double-queue");
+
+    match app.get_result(id1).await.unwrap() {
+        JobResult::Success { payload } => {
+            let out: PingResult = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(out.echo, "once");
+        }
+        JobResult::Failure { message } => panic!("{message}"),
+    }
+
+    // Nothing left pending.
+    assert!(
+        app.broker()
+            .claim(
+                &[QueueName::default()],
+                Duration::from_secs(30),
+                Duration::ZERO
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn redis_app_roundtrip_with_redis_results() {
     let (_guard, url) = redis_url().await;
     let prefix = "capivara_redis_results:";

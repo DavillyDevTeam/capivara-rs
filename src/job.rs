@@ -70,6 +70,18 @@ pub struct Job {
     /// JSON-encoded `Task::Args`.
     pub payload: Vec<u8>,
     pub attempts: u32,
+    /// Optional producer-side dedupe key. When set on enqueue, the broker returns
+    /// the existing [`JobId`] if the key was seen before (no duplicate queue entry).
+    ///
+    /// Keys are **global per broker** (Memory process / Redis key `prefix`), not
+    /// namespaced by `task_name` or `queue`. Include the task name (and queue if
+    /// needed) in the key string when uniqueness must not collide across tasks.
+    /// Empty / whitespace-only keys are rejected with
+    /// [`crate::CapivaraError::EmptyIdempotencyKey`].
+    ///
+    /// `#[serde(default)]` so older job JSON without this field deserializes as `None`.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 impl Job {
@@ -80,6 +92,25 @@ impl Job {
             task_name: task_name.into(),
             payload,
             attempts: 0,
+            idempotency_key: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_without_idempotency_field_deserializes() {
+        let id = JobId::new();
+        // Legacy wire form (pre-M2-3) — no idempotency_key field.
+        let json = format!(
+            r#"{{"id":"{}","queue":"default","task_name":"add","payload":[],"attempts":0}}"#,
+            id.0
+        );
+        let job: Job = serde_json::from_str(&json).expect("legacy job json");
+        assert_eq!(job.id, id);
+        assert_eq!(job.idempotency_key, None);
     }
 }

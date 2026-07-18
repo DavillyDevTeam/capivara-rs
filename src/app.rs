@@ -111,6 +111,40 @@ impl App {
 
     /// Enqueue a job for `T` with typed arguments.
     pub async fn send<T: Task>(&self, args: &T::Args) -> Result<JobId> {
+        self.send_inner::<T>(args, None).await
+    }
+
+    /// Enqueue with a producer **idempotency key** for safe producer retries.
+    ///
+    /// If the same key was already enqueued on this broker, returns the existing
+    /// [`JobId`] and does **not** create a second queue entry. This applies even
+    /// when the first job is still in-flight, completed, or dead-lettered.
+    ///
+    /// **At-least-once still applies** for in-flight worker crashes: the key only
+    /// dedupes producer-side retries, not worker redelivery after lease recovery.
+    /// Tasks should still be written to tolerate duplicate execution.
+    ///
+    /// Keys are **global per broker** (not scoped by task name or queue). Callers
+    /// that need isolation should embed task/queue in the key string (e.g.
+    /// `"add:order-42"`). Empty / whitespace-only keys return
+    /// [`CapivaraError::EmptyIdempotencyKey`].
+    pub async fn send_with_idempotency_key<T: Task>(
+        &self,
+        args: &T::Args,
+        key: impl Into<String>,
+    ) -> Result<JobId> {
+        let key = key.into();
+        if key.trim().is_empty() {
+            return Err(CapivaraError::EmptyIdempotencyKey);
+        }
+        self.send_inner::<T>(args, Some(key)).await
+    }
+
+    async fn send_inner<T: Task>(
+        &self,
+        args: &T::Args,
+        idempotency_key: Option<String>,
+    ) -> Result<JobId> {
         {
             let reg = self.registry.lock().await;
             if !reg.contains(T::NAME) {
@@ -122,6 +156,7 @@ impl App {
         let payload = serde_json::to_vec(args)?;
         let mut job = Job::new(T::NAME, payload);
         job.queue = self.default_queue.clone();
+        job.idempotency_key = idempotency_key;
         self.broker.enqueue(job).await
     }
 

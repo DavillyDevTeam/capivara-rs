@@ -12,10 +12,14 @@
 //! - `{prefix}lease` — ZSET score = lease expiry (unix ms),
 //!   member = `{queue}\x1f{id}\x1f{token}`
 //! - `{prefix}delayed` — ZSET score = available_at (unix ms), member = `{queue}\x1f{id}`
+//! - `{prefix}idempotency:{key}` — STRING job id (SET NX; producer retry dedupe; no TTL in M2)
 //!
 //! Claim / promote / recover / ack / dead_letter paths use **Lua** so multi-worker
 //! races cannot double-enqueue or delete unowned job bodies. Claim tokens ensure
-//! late ack/nack/dead_letter after recover cannot steal a newer claim.
+//! late ack/nack/dead_letter after recover cannot steal a newer claim. Enqueue with
+//! an idempotency key uses Lua: **job body SET first**, then map SET NX, then LPUSH.
+//! On NX loss the orphan body is `DEL`'d and the winner id is returned — so a
+//! mid-script error cannot leave a map entry without a body (silent lost enqueue).
 
 use crate::broker::{Broker, ClaimToken, ClaimedJob, DeadLetter, NackAction};
 use crate::error::{CapivaraError, Result};
@@ -62,6 +66,8 @@ pub struct RedisBroker {
     promote_script: Script,
     /// Atomically: for each expired lease member, ZREM then LPUSH only if we won ZREM.
     recover_script: Script,
+    /// Body SET first, then SET NX map; on win LPUSH pending; on lose DEL orphan body + return winner.
+    enqueue_idempotent_script: Script,
 }
 
 impl RedisBroker {
@@ -225,6 +231,25 @@ impl RedisBroker {
             "#,
         );
 
+        // KEYS[1]=idempotency key, KEYS[2]=job key, KEYS[3]=pending list
+        // ARGV[1]=job id string, ARGV[2]=job body JSON
+        // Body first so a mid-script OOM/error after map NX cannot leave a map
+        // entry with no job body (producer retry would return that id → silent
+        // lost enqueue). On NX loss DEL the orphan body and return the winner.
+        // Returns the winning job id (existing or newly enqueued).
+        let enqueue_idempotent_script = Script::new(
+            r#"
+            redis.call('SET', KEYS[2], ARGV[2])
+            local set = redis.call('SET', KEYS[1], ARGV[1], 'NX')
+            if not set then
+              redis.call('DEL', KEYS[2])
+              return redis.call('GET', KEYS[1])
+            end
+            redis.call('LPUSH', KEYS[3], ARGV[1])
+            return ARGV[1]
+            "#,
+        );
+
         Ok(Self {
             conn,
             prefix: config.prefix,
@@ -234,6 +259,7 @@ impl RedisBroker {
             dead_letter_script,
             promote_script,
             recover_script,
+            enqueue_idempotent_script,
         })
     }
 
@@ -275,6 +301,10 @@ impl RedisBroker {
 
     fn delayed_key(&self) -> String {
         format!("{}delayed", self.prefix)
+    }
+
+    fn idempotency_key(&self, key: &str) -> String {
+        format!("{}idempotency:{}", self.prefix, key)
     }
 
     /// Lease ZSET member: `{queue}\x1f{id}\x1f{token}`.
@@ -392,6 +422,28 @@ impl Broker for RedisBroker {
         let job_key = self.job_key(&id);
         let pending = self.pending_key(job.queue.as_str());
         let body = serde_json::to_string(&job)?;
+
+        // Producer idempotency: body first, then SET NX map; return existing on collision.
+        if let Some(ref key) = job.idempotency_key {
+            if key.trim().is_empty() {
+                return Err(CapivaraError::EmptyIdempotencyKey);
+            }
+            let idemp = self.idempotency_key(key);
+            let returned: String = self
+                .enqueue_idempotent_script
+                .key(&idemp)
+                .key(&job_key)
+                .key(&pending)
+                .arg(id.to_string())
+                .arg(&body)
+                .invoke_async(&mut conn)
+                .await
+                .map_err(|e| CapivaraError::Broker(e.to_string()))?;
+            let parsed = uuid::Uuid::parse_str(&returned).map_err(|e| {
+                CapivaraError::Broker(format!("invalid idempotency job id {returned}: {e}"))
+            })?;
+            return Ok(JobId(parsed));
+        }
 
         // Atomic SET + LPUSH so a crash cannot leave a list entry without a body
         // (or orphan body only — SET-first still preferred).

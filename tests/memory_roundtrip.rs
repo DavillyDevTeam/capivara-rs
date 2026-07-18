@@ -741,6 +741,163 @@ async fn late_ack_after_recover_does_not_steal_new_claim() {
 }
 
 #[tokio::test]
+async fn producer_idempotency_key_dedupes_double_enqueue() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    struct CountedAdd;
+
+    impl Task for CountedAdd {
+        const NAME: &'static str = "counted_add";
+        type Args = AddArgs;
+        type Output = AddResult;
+
+        async fn run(args: Self::Args) -> Result<Self::Output, TaskError> {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            Ok(AddResult {
+                sum: args.x + args.y,
+            })
+        }
+    }
+
+    RUNS.store(0, Ordering::SeqCst);
+
+    let app = App::new(MemoryBroker::new()).with_result_backend(MemoryResultBackend::new());
+    app.register::<CountedAdd>().await.unwrap();
+
+    let args = AddArgs { x: 1, y: 2 };
+    let id1 = app
+        .send_with_idempotency_key::<CountedAdd>(&args, "order-42")
+        .await
+        .unwrap();
+    let id2 = app
+        .send_with_idempotency_key::<CountedAdd>(&args, "order-42")
+        .await
+        .unwrap();
+    assert_eq!(id1, id2, "same key must return the same JobId");
+
+    // Different key still enqueues a distinct job.
+    let id3 = app
+        .send_with_idempotency_key::<CountedAdd>(&args, "order-43")
+        .await
+        .unwrap();
+    assert_ne!(id1, id3);
+
+    let n = app.run_worker(None).await.unwrap();
+    assert_eq!(n, 2, "duplicate key must not double-queue");
+    assert_eq!(
+        RUNS.load(Ordering::SeqCst),
+        2,
+        "handler should run once per unique key"
+    );
+
+    match app.get_result(id1).await.unwrap() {
+        JobResult::Success { payload } => {
+            let out: AddResult = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(out.sum, 3);
+        }
+        JobResult::Failure { message } => panic!("unexpected failure: {message}"),
+    }
+
+    // Map still applies after the first job completed: same key → same id, no re-drive.
+    let id_after = app
+        .send_with_idempotency_key::<CountedAdd>(&args, "order-42")
+        .await
+        .unwrap();
+    assert_eq!(id_after, id1);
+    assert!(
+        app.broker()
+            .claim(
+                &[QueueName::default()],
+                Duration::from_secs(30),
+                Duration::ZERO
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "completed key must not re-queue a second pending job"
+    );
+    assert_eq!(
+        RUNS.load(Ordering::SeqCst),
+        2,
+        "post-complete resend must not re-run the handler"
+    );
+}
+
+#[tokio::test]
+async fn producer_idempotency_rejects_empty_key() {
+    let app = App::new(MemoryBroker::new());
+    app.register::<Add>().await.unwrap();
+    let args = AddArgs { x: 1, y: 2 };
+
+    let err = app
+        .send_with_idempotency_key::<Add>(&args, "")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CapivaraError::EmptyIdempotencyKey),
+        "empty key: {err}"
+    );
+
+    let err = app
+        .send_with_idempotency_key::<Add>(&args, "   ")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CapivaraError::EmptyIdempotencyKey),
+        "whitespace key: {err}"
+    );
+
+    // Raw broker path rejects too.
+    let broker = MemoryBroker::new();
+    let mut job = Job::new("add", br#"{"x":1,"y":2}"#.to_vec());
+    job.idempotency_key = Some("".into());
+    let err = broker.enqueue(job).await.unwrap_err();
+    assert!(matches!(err, CapivaraError::EmptyIdempotencyKey));
+}
+
+#[tokio::test]
+async fn producer_idempotency_via_raw_enqueue() {
+    let broker = MemoryBroker::new();
+    let mut job1 = Job::new("add", br#"{"x":1,"y":2}"#.to_vec());
+    job1.queue = QueueName::default();
+    job1.idempotency_key = Some("raw-key".into());
+    let id1 = broker.enqueue(job1).await.unwrap();
+
+    let mut job2 = Job::new("add", br#"{"x":9,"y":9}"#.to_vec());
+    job2.queue = QueueName::default();
+    job2.idempotency_key = Some("raw-key".into());
+    let id2 = broker.enqueue(job2).await.unwrap();
+    assert_eq!(id1, id2);
+
+    let claimed = broker
+        .claim(
+            &[QueueName::default()],
+            Duration::from_secs(30),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap()
+        .expect("one job");
+    assert_eq!(claimed.job.id, id1);
+    broker.ack(&id1, &claimed.claim_token).await.unwrap();
+
+    assert!(
+        broker
+            .claim(
+                &[QueueName::default()],
+                Duration::from_secs(30),
+                Duration::ZERO
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "second enqueue with same key must not leave another pending job"
+    );
+}
+
+#[tokio::test]
 async fn late_dead_letter_after_recover_does_not_steal_new_claim() {
     use std::time::Duration;
 
