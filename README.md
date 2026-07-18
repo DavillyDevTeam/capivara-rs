@@ -13,7 +13,50 @@ a universal CLI that runs arbitrary remote code.
 | **Package** | `capivara` (repo: [`capivara-rs`](https://github.com/DavillyDevTeam/capivara-rs)) |
 | **Org** | [DavillyDevTeam](https://github.com/DavillyDevTeam) |
 | **License** | MIT OR Apache-2.0 |
-| **Status** | **M3-3** optional metrics scrape + M3-2 facade + M3-1 tracing; M2 reliability; M1 Memory + Redis |
+| **Status** | **M3 complete** (tracing + metrics + optional scrape); M2 reliability; M1 Memory + Redis |
+
+## Architecture
+
+Celery-like *topology* (not Celery protocol). Deeper map: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+```mermaid
+flowchart LR
+  subgraph Producer
+    P[App::send]
+  end
+
+  subgraph Broker["Broker"]
+    MB[(MemoryBroker)]
+    RB[(RedisBroker)]
+  end
+
+  subgraph Worker
+    W[claim → handle → ack / nack / DLQ]
+  end
+
+  subgraph Results["Optional ResultBackend"]
+    MR[(MemoryResultBackend)]
+    RR[(RedisResultBackend)]
+  end
+
+  P --> MB
+  P --> RB
+  MB --> W
+  RB --> W
+  W --> MR
+  W --> RR
+  P -.->|get_result| MR
+  P -.->|get_result| RR
+```
+
+| | Memory (default) | Redis (`redis` feature) |
+|---|---|---|
+| **Process model** | Single process only | Multi-process (shared `url` + `prefix`) |
+| **Broker** | `MemoryBroker` | `RedisBroker` (LIST + lease, Lua) |
+| **Results** | `MemoryResultBackend` | `RedisResultBackend` (JSON STRING, 24h TTL) |
+| **Use** | Unit tests, in-process apps | Producers + workers across machines |
+
+Omit a result backend for **fire-and-forget**. Delivery is **at-least-once** — see guarantees below.
 
 ## What works today (M0–M3)
 
@@ -42,8 +85,27 @@ a universal CLI that runs arbitrary remote code.
 - Dependabot for Cargo / Actions; secret scanning enabled on the repo
 
 **Delivery, retries, DLQ, results, and idempotency** are spelled out below —
-see [Delivery guarantees & failure modes](#delivery-guarantees--failure-modes)
-and [docs/guarantees.md](docs/guarantees.md).
+see [Failure modes in 10 minutes](#failure-modes-in-10-minutes),
+[Delivery guarantees & failure modes](#delivery-guarantees--failure-modes),
+[docs/guarantees.md](docs/guarantees.md), and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Failure modes in 10 minutes
+
+Capivara is **at-least-once**, not exactly-once. Design handlers for duplicate work.
+Full rationale: [docs/guarantees.md](docs/guarantees.md).
+
+| What you see | What happened | What to do |
+|---|---|---|
+| **Same job runs twice** | Lease expired before `ack`/`nack`/`dead_letter`; recover-on-claim redelivered with a **new** `ClaimToken` and `attempts++`. Late settle from the first claim loses (`JobNotFound`) and does not steal the newer claim. | Make `Task::run` **idempotent** (or external de-dupe). Prefer short work relative to `with_lease` (default **30s**). Producer `idempotency_key` only de-dupes **enqueue**, not worker redelivery. |
+| **`get_result` → `ResultNotFound` mid-flight** | Intermediate retries **do not** store Failure. No result yet means “still pending / retrying / never stored,” not “failed forever.” | Poll until `Success` or terminal `Failure`, or treat missing as in-progress when the job is still live. Without a result backend you always get `NoResultBackend`. |
+| **Job on DLQ / `list_dead`** | Attempts exhausted (`attempts >= max_attempts`, default **3**) or **unknown task name**. Body + reason retained for inspect. | Inspect `Broker::list_dead(&queue)`. **No redrive API in M2/M3** — re-enqueue manually if needed. Terminal `JobResult::Failure` is written only if `dead_letter` confirmed ownership. |
+| **Metrics `status="dead"`** | `capivara_jobs_completed_total{status="dead"}` — claim was **dead-lettered** (terminal). Contrast: `status="failure"` means **nacked for retry**, not terminal. | Alert on `dead` (and DLQ depth) for real give-ups; do not treat `failure` as permanent. Lost-lease races do **not** increment completion counters. |
+
+Other sharp edges worth one line each:
+
+- Crash **after** storing `Success` and **before** `ack` can redeliver and **rewrite** the stored result.
+- One `run_worker` drain does **not** sleep for nack delays — re-invoke after delay, or run a continuous loop in production.
+- Redis `capivara_queue_depth` is **not** updated on the hot path (no `LLEN` under load); Memory updates pending length.
 
 ## Features
 
@@ -186,11 +248,14 @@ app.run_worker(None).await?;
 
 ## Observability
 
-### Tracing
+How-to for apps embedding capivara. Structural notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#observability-surfaces).
 
-Capivara depends on the [`tracing`](https://docs.rs/tracing) facade and emits **spans**
-on the main job lifecycle paths. It does **not** install a global subscriber — your
-application (or binary) chooses the exporter.
+Capivara is a **library**: it emits spans and metrics through facades. **Your binary**
+installs the tracing subscriber and/or metrics recorder (or uses the optional scrape helper).
+
+### Tracing (subscriber in your binary)
+
+Always-on [`tracing`](https://docs.rs/tracing) dependency. Spans on core paths:
 
 | Span name | Where |
 |---|---|
@@ -210,23 +275,27 @@ Raw `App::broker().enqueue` is intentionally **uninstrumented** (escape hatch) �
 futures spawned for panic isolation re-attach the current `capivara.handle` span so
 app-authored spans inside `Task::run` still parent correctly.
 
-Minimal app-side setup with the usual env filter:
+```toml
+# Cargo.toml of your binary (not required by the library):
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+```
 
 ```rust
-// In your binary / main (not required by the library):
-// tracing_subscriber = { version = "0.3", features = ["env-filter"] }
+// In main, before App / worker work:
 tracing_subscriber::fmt()
     .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
     .init();
-// RUST_LOG=capivara=info,info cargo run
 ```
 
-### Metrics
+```bash
+RUST_LOG=capivara=info,info cargo run
+# or quieter: RUST_LOG=capivara=debug,warn
+```
 
-Capivara depends on the [`metrics`](https://docs.rs/metrics) facade and emits
-Prometheus-friendly counters/histograms/gauges. The core library does **not**
-install a global recorder. Either wire an exporter in your binary, or enable the
-**`metrics-http`** feature for a built-in scrape server.
+### Metrics (facade + optional scrape)
+
+Always-on [`metrics`](https://docs.rs/metrics) facade. The core library does **not**
+install a global recorder. Wire an exporter yourself, or enable **`metrics-http`**.
 
 | Metric | Type | Labels |
 |---|---|---|
@@ -236,16 +305,19 @@ install a global recorder. Either wire an exporter in your binary, or enable the
 | `capivara_claim_wait_seconds` | histogram | `queue` |
 | `capivara_queue_depth` | gauge | `queue` (best-effort) |
 
-`status` values: `success` (acked), `failure` (nacked for retry), `dead` (dead-lettered).
-Each is recorded only when settle confirms claim ownership (lost-lease races do not inflate counters).
+`status` values on `capivara_jobs_completed_total`:
 
-**Cardinality:** never label by `job_id`.
+| Label | Meaning |
+|---|---|
+| `success` | Handler succeeded; claim **acked** |
+| `failure` | Handler failed this attempt; claim **nacked for retry** (not terminal) |
+| `dead` | Claim **dead-lettered** (terminal: max attempts / unknown task) |
 
-**Queue depth:** `MemoryBroker` updates the gauge from in-process pending length
-(cheap). Redis does **not** call `LLEN` on the claim/enqueue hot path (documented
-as costly under load). Sample depth out-of-band if you need it for Redis.
+Recorded only when settle confirms claim ownership (lost-lease races do not inflate counters).
+**Never** label by `job_id`. Constants: [`capivara::metrics`](src/metrics.rs).
 
-Constants and helpers live in [`capivara::metrics`](src/metrics.rs).
+**Queue depth:** `MemoryBroker` updates from in-process pending length. Redis does **not**
+`LLEN` on the claim/enqueue hot path — sample out-of-band if needed.
 
 #### Optional scrape endpoint (`metrics-http`)
 
@@ -254,26 +326,37 @@ capivara = { version = "0.0.1", features = ["metrics-http"] }
 ```
 
 ```rust
-// In your binary (requires a Tokio runtime):
-// let _metrics = capivara::metrics_http::serve()?; // 127.0.0.1:9090
-// let _metrics = capivara::metrics_http::start_metrics_server("127.0.0.1:9100".parse()?)?;
-```
+// Requires a Tokio runtime. Call once at process startup.
+use capivara::metrics_http;
 
-- Installs the **global** Prometheus recorder (only one global recorder per process).
-- Serves Prometheus text exposition (scrape `GET /metrics`; exporter accepts any path).
-- Default bind: **`127.0.0.1:9090`** ([`metrics_http::DEFAULT_BIND`](src/metrics_http.rs)).
-- **v0 security:** no authentication. Keep the bind on loopback or isolate the
-  scrape network; put TLS/auth at a reverse proxy if you expose it.
+#[tokio::main]
+async fn main() -> capivara::Result<()> {
+    // Default: 127.0.0.1:9090 — scrape GET /metrics
+    let _metrics = metrics_http::serve()?;
+    // Or: metrics_http::start_metrics_server("127.0.0.1:9100".parse()?)?;
+
+    // ... build App, register tasks, run_worker ...
+    Ok(())
+}
+```
 
 ```bash
+curl -s http://127.0.0.1:9090/metrics | head
 cargo test --features metrics-http
 ```
+
+- Installs the **global** Prometheus recorder (only one per process; a second install errors).
+- Prometheus text exposition (scrape `GET /metrics`; exporter accepts any path).
+- Default bind: **`127.0.0.1:9090`** ([`metrics_http::DEFAULT_BIND`](src/metrics_http.rs)).
+- **v0 security:** no authentication. Keep loopback or isolate the scrape network;
+  put TLS/auth at a reverse proxy if you expose it.
 
 ## Not yet
 
 - DLQ replay / redrive API
 - Proc-macro or `app.task("name", fn)` sugar
-- crates.io publish (`publish = false` until then)
+- crates.io publish — stay at **`0.0.1`** / **`publish = false`** until the maintainer
+  agrees a **`0.1.0`** release (discuss after M3; do not publish unilaterally)
 
 ## Quick example
 

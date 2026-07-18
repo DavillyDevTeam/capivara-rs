@@ -1,8 +1,10 @@
 # Delivery guarantees & architecture notes
 
-This document records **what capivara promises today** (M0–M2) and the design
+This document records **what capivara promises today** (M0–M3) and the design
 decisions behind those promises. For a shorter operator-facing summary, see the
-README section [Delivery guarantees & failure modes](../README.md#delivery-guarantees--failure-modes).
+README sections [Failure modes in 10 minutes](../README.md#failure-modes-in-10-minutes)
+and [Delivery guarantees & failure modes](../README.md#delivery-guarantees--failure-modes).
+Structural map: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 APIs referenced: `App`, `Broker`, `RetryPolicy`, `JobResult`, `DeadLetter`,
 `ClaimToken`, `send_with_idempotency_key`.
@@ -221,13 +223,31 @@ durable commit log: store-then-ack Success can be rewritten after redelivery (§
 
 ---
 
-## 7. Explicit non-goals (current milestones)
+## 7. Metrics vs delivery outcomes
+
+Completion counter `capivara_jobs_completed_total` labels (recorded only when settle
+confirms claim ownership):
+
+| `status` | Delivery meaning |
+|---|---|
+| `success` | Handler `Ok`; claim **acked** |
+| `failure` | Handler Err/panic this attempt; claim **nacked for retry** — **not** terminal |
+| `dead` | Claim **dead-lettered** (max attempts / unknown task) — terminal path |
+
+Do not treat metrics `failure` as permanent give-up; pair alerts on `dead` with
+`list_dead` / terminal `JobResult::Failure`. Lost-lease `JobNotFound` on settle does
+**not** increment the counter (same for all three statuses).
+
+---
+
+## 8. Explicit non-goals (current milestones)
 
 - Celery wire protocol / pickle / shipping functions over the wire.
 - Exactly-once execution end-to-end.
 - DLQ automatic replay.
 - Cross-process Memory broker.
 - Idempotency key TTL / eviction policy (M2: permanent map entry per key).
+- Unilateral crates.io publish — stay `publish = false` until maintainer agrees **0.1.0**.
 
-When any of these change, update this file and the README guarantees section
-together so docs stay aligned with APIs.
+When any of these change, update this file, [ARCHITECTURE.md](ARCHITECTURE.md), and
+the README guarantees section together so docs stay aligned with APIs.
