@@ -16,6 +16,9 @@ authors = ["Duarte Mainart Tecnologia e Publicidade LTDA"]
 default = []
 # Opt-in Redis broker + Redis result backend. Memory backends need no feature.
 redis = ["dep:redis"]
+# Experimental RabbitMQ broker (`RabbitBroker` via lapin). Not production-ready;
+# see docs/BROKER.md for capability gaps vs Memory/Redis.
+rabbitmq = ["dep:lapin", "dep:tokio-executor-trait", "dep:tokio-reactor-trait"]
 # Opt-in Prometheus scrape HTTP server (`GET /metrics` on 127.0.0.1:9090 by default).
 # Pulls `metrics-exporter-prometheus` + hyper; not enabled by default.
 metrics-http = ["dep:metrics-exporter-prometheus"]
@@ -29,6 +32,10 @@ tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "sy
 tracing = "0.1"
 uuid = { version = "1.23.4", features = ["v4", "serde"] }
 redis = { version = "0.27", optional = true, default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+# Lapin 2.x keeps MSRV aligned with this crate (1.85); 4.x requires rustc ≥ 1.88.
+lapin = { version = "2.5", optional = true }
+tokio-executor-trait = { version = "2.1", optional = true }
+tokio-reactor-trait = { version = "1.1", optional = true }
 rand = "0.8"
 metrics = "0.24"
 # HTTP scrape only (no push-gateway / rustls). Used solely by `metrics-http`.
@@ -41,7 +48,7 @@ path = "src/lib.rs"
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "time"] }
 testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["redis"] }
+testcontainers-modules = { version = "0.11", features = ["redis", "rabbitmq"] }
 # For Redis TTL assertions in integration tests (same feature set as optional dep).
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
@@ -50,6 +57,11 @@ metrics-util = { version = "0.20", default-features = false, features = ["debugg
 name = "redis_broker"
 path = "tests/redis_broker.rs"
 required-features = ["redis"]
+
+[[test]]
+name = "rabbitmq_broker"
+path = "tests/rabbitmq_broker.rs"
+required-features = ["rabbitmq"]
 
 [[test]]
 name = "metrics_http"

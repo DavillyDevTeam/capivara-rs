@@ -3,20 +3,25 @@
 //! Celery analogy: Kombu / Redis transport (shape only, not protocol interop).
 //! - M0/default: [`memory::MemoryBroker`] (single-process).
 //! - Feature `redis`: [`redis_broker::RedisBroker`] (multi-process capable).
-//! - Next (experimental, separate PR): RabbitMQ spike — not implemented here.
+//! - Feature `rabbitmq`: [`rabbit::RabbitBroker`] (**experimental** spike; gaps vs
+//!   Memory/Redis — see `docs/BROKER.md`).
 //! - Kafka is **not planned**.
 //!
 //! Terminal failures go to a **per-queue dead-letter list** via
 //! [`Broker::dead_letter`] (job body retained for inspect; no replay API).
 //!
-//! **Capability matrix** (Memory vs Redis, Rabbit placeholder):
+//! **Capability matrix** (Memory vs Redis vs experimental Rabbit):
 //! see crate docs `docs/BROKER.md`.
 
 mod memory;
+#[cfg(feature = "rabbitmq")]
+mod rabbit;
 #[cfg(feature = "redis")]
 mod redis_broker;
 
 pub use memory::MemoryBroker;
+#[cfg(feature = "rabbitmq")]
+pub use rabbit::{RabbitBroker, RabbitConfig};
 #[cfg(feature = "redis")]
 pub use redis_broker::{RedisBroker, RedisConfig};
 
@@ -71,8 +76,9 @@ pub struct ClaimedJob {
 pub enum NackAction {
     /// Put the job aside until `delay` elapses, then make it claimable again.
     ///
-    /// Both Redis and Memory honor `delay` (Memory uses an in-process delayed
-    /// list; Redis uses a delayed ZSET promoted on claim).
+    /// Memory uses an in-process delayed list; Redis a delayed ZSET promoted on
+    /// claim; experimental Rabbit (`rabbitmq`) acks then publishes to a TTL+DLX
+    /// hop queue (see `docs/BROKER.md`).
     RequeueAfter { delay: Duration },
 }
 
@@ -92,8 +98,9 @@ pub struct DeadLetter {
 /// # Stabilized multi-broker contract
 ///
 /// Memory and Redis implement the full capability matrix (enqueue, claim+block,
-/// lease/recover, delayed nack, DLQ, `list_dead`, producer idempotency). New
-/// backends should match that matrix or document gaps. See `docs/BROKER.md`.
+/// lease/recover, delayed nack, DLQ, `list_dead`, producer idempotency). The
+/// experimental Rabbit backend documents intentional gaps (no timed lease,
+/// process-local tokens/idempotency). See `docs/BROKER.md`.
 ///
 /// # Settle rules
 ///

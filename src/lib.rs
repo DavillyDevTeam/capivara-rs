@@ -13,6 +13,8 @@
 //!
 //! - *(default)* Memory broker/results for in-process tests.
 //! - `redis` — [`RedisBroker`] + [`RedisResultBackend`] (multi-process capable).
+//! - `rabbitmq` — experimental [`RabbitBroker`] (lapin); **not** production-ready —
+//!   see `docs/BROKER.md` for capability gaps.
 //! - `metrics-http` — optional Prometheus scrape server (`GET /metrics`; see [`metrics_http`]).
 //!
 //! # Example
@@ -77,6 +79,8 @@ mod worker;
 
 pub use app::App;
 pub use broker::{Broker, ClaimToken, ClaimedJob, DeadLetter, MemoryBroker, NackAction};
+#[cfg(feature = "rabbitmq")]
+pub use broker::{RabbitBroker, RabbitConfig};
 #[cfg(feature = "redis")]
 pub use broker::{RedisBroker, RedisConfig};
 pub use error::{CapivaraError, Result, TaskError};

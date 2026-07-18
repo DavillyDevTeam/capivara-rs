@@ -13,7 +13,7 @@ a universal CLI that runs arbitrary remote code.
 | **Package** | `capivara` (repo: [`capivara-rs`](https://github.com/DavillyDevTeam/capivara-rs)) |
 | **Org** | [DavillyDevTeam](https://github.com/DavillyDevTeam) |
 | **License** | MIT OR Apache-2.0 |
-| **Status** | **M3 complete**; M4 multi-broker path started (Broker capability matrix frozen); Memory + Redis |
+| **Status** | **M3 complete**; M4 multi-broker path (Broker matrix + experimental RabbitMQ spike); Memory + Redis + experimental Rabbit |
 
 ## Architecture
 
@@ -28,6 +28,7 @@ flowchart LR
   subgraph Broker["Broker"]
     MB[(MemoryBroker)]
     RB[(RedisBroker)]
+    QB[(RabbitBroker experimental)]
   end
 
   subgraph Worker
@@ -41,25 +42,27 @@ flowchart LR
 
   P --> MB
   P --> RB
+  P --> QB
   MB --> W
   RB --> W
+  QB --> W
   W --> MR
   W --> RR
   P -.->|get_result| MR
   P -.->|get_result| RR
 ```
 
-| | Memory (default) | Redis (`redis` feature) |
-|---|---|---|
-| **Process model** | Single process only | Multi-process (shared `url` + `prefix`) |
-| **Broker** | `MemoryBroker` | `RedisBroker` (LIST + lease, Lua) |
-| **Results** | `MemoryResultBackend` | `RedisResultBackend` (JSON STRING, 24h TTL) |
-| **Use** | Unit tests, in-process apps | Producers + workers across machines |
+| | Memory (default) | Redis (`redis` feature) | RabbitMQ (`rabbitmq`, **experimental**) |
+|---|---|---|---|
+| **Process model** | Single process only | Multi-process (shared `url` + `prefix`) | Multi-process (shared AMQP URL + prefix) |
+| **Broker** | `MemoryBroker` | `RedisBroker` (LIST + lease, Lua) | `RabbitBroker` (lapin; **no** timed lease) |
+| **Results** | `MemoryResultBackend` | `RedisResultBackend` (JSON STRING, 24h TTL) | Use Memory/Redis results; no Rabbit result backend |
+| **Use** | Unit tests, in-process apps | Producers + workers across machines | Spike / multi-worker experiments only |
 
 Omit a result backend for **fire-and-forget**. Delivery is **at-least-once** — see guarantees below.
 
 **Broker capability matrix** (enqueue, claim+block, lease/recover, delayed nack, DLQ,
-`list_dead`, producer idempotency — Memory vs Redis; Rabbit next / Kafka not planned):
+`list_dead`, producer idempotency — Memory vs Redis vs experimental Rabbit; Kafka not planned):
 [docs/BROKER.md](docs/BROKER.md).
 
 ## What works today (M0–M3)
@@ -118,13 +121,18 @@ Other sharp edges worth one line each:
 |---|---|---|
 | *(none)* | yes | `MemoryBroker` / `MemoryResultBackend` |
 | `redis` | **opt-in** | `RedisBroker` + `RedisResultBackend` (multi-process capable) |
+| `rabbitmq` | **opt-in, experimental** | `RabbitBroker` (lapin). **Not production-ready** — see [docs/BROKER.md](docs/BROKER.md) gaps |
 | `metrics-http` | **opt-in** | Prometheus scrape HTTP server (`capivara::metrics_http`) |
 
 ```toml
 capivara = { version = "0.0.1", features = ["redis"] }
+# experimental RabbitMQ broker (not Redis parity; see docs/BROKER.md):
+# capivara = { version = "0.0.1", features = ["rabbitmq"] }
 # optional scrape endpoint (pulls metrics-exporter-prometheus + hyper):
 # capivara = { version = "0.0.1", features = ["metrics-http"] }
 ```
+
+Default features stay free of Redis and lapin.
 
 Redis integration tests (`cargo test --features redis`) use **testcontainers** when
 `REDIS_URL` is unset. For local runs without a working testcontainers Docker socket:
@@ -132,6 +140,14 @@ Redis integration tests (`cargo test --features redis`) use **testcontainers** w
 ```bash
 docker run -d --rm -p 6379:6379 docker.io/library/redis:7-alpine
 REDIS_URL=redis://127.0.0.1:6379/ cargo test --features redis
+```
+
+RabbitMQ integration tests (`cargo test --features rabbitmq`) use **testcontainers**
+when `RABBITMQ_URL` / `AMQP_URL` is unset:
+
+```bash
+docker run -d --rm -p 5672:5672 docker.io/library/rabbitmq:3.8-management
+RABBITMQ_URL=amqp://guest:guest@127.0.0.1:5672/%2f cargo test --features rabbitmq
 ```
 
 ## Delivery guarantees & failure modes
@@ -358,8 +374,10 @@ cargo test --features metrics-http
 
 ## Not yet
 
-- **RabbitMQ broker** — experimental spike planned next (capability gaps vs Redis expected;
-  see [docs/BROKER.md](docs/BROKER.md)); **Kafka is not planned**
+- **RabbitMQ production polish** — experimental `RabbitBroker` exists (`rabbitmq` feature)
+  but is **not** Redis parity (no timed lease/recover, process-local claim tokens /
+  idempotency, best-effort `list_dead`); see [docs/BROKER.md](docs/BROKER.md)
+- **Kafka** is **not planned**
 - DLQ replay / redrive API
 - Proc-macro or `app.task("name", fn)` sugar
 - crates.io publish — stay at **`0.0.1`** / **`publish = false`** until the maintainer
