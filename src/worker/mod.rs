@@ -11,6 +11,7 @@ use crate::error::{CapivaraError, Result};
 use crate::job::{JobId, QueueName};
 use crate::registry::Registry;
 use crate::result::{JobResult, ResultBackend};
+use crate::retry::RetryPolicy;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -20,10 +21,6 @@ use tokio::task::JoinSet;
 pub const DEFAULT_LEASE: Duration = Duration::from_secs(30);
 /// Non-blocking claim so `run_worker` drains without sleeping when empty.
 pub const DEFAULT_BLOCK: Duration = Duration::ZERO;
-/// Attempts before terminal ack (claim increments attempts, so attempt 3 is last).
-pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
-/// Delay before a failed job becomes claimable again.
-pub const DEFAULT_NACK_DELAY: Duration = Duration::from_secs(5);
 /// Default max concurrent in-flight jobs per worker drain.
 pub const DEFAULT_CONCURRENCY: usize = 4;
 
@@ -36,10 +33,8 @@ pub struct Worker {
     pub queues: Vec<QueueName>,
     /// Claim lease duration.
     pub lease: Duration,
-    /// Max claim attempts before terminal ack on failure.
-    pub max_attempts: u32,
-    /// Delay used for [`NackAction::RequeueAfter`] on retryable failures.
-    pub nack_delay: Duration,
+    /// Retry / nack requeue policy (max attempts + exponential backoff delay).
+    pub retry_policy: RetryPolicy,
     /// Max concurrent in-flight jobs (clamped to ≥ 1).
     pub concurrency: usize,
 }
@@ -52,6 +47,9 @@ impl Worker {
     /// - Err / panic → store Failure (if backend) → nack(RequeueAfter) while
     ///   `attempts < max_attempts`, else terminal ack
     /// - Unknown task → store Failure (if backend) → terminal ack (not retryable)
+    ///
+    /// Nack delay is computed via [`RetryPolicy::delay_for_attempt`] from the
+    /// job's current claim count (`Job.attempts`).
     ///
     /// Lost-lease `JobNotFound` from ack/nack is non-fatal (another claim may
     /// already own the job after recover); the drain continues.
@@ -127,12 +125,10 @@ impl Worker {
                     let broker = Arc::clone(&self.broker);
                     let results = self.results.clone();
                     let registry = Arc::clone(&self.registry);
-                    let max_attempts = self.max_attempts;
-                    let nack_delay = self.nack_delay;
+                    let retry_policy = self.retry_policy;
                     in_flight.spawn(async move {
                         let _permit: OwnedSemaphorePermit = permit;
-                        process_one(broker, results, registry, claimed, max_attempts, nack_delay)
-                            .await
+                        process_one(broker, results, registry, claimed, retry_policy).await
                     });
                 }
                 Ok(None) => {
@@ -227,8 +223,7 @@ async fn process_one(
     results: Option<Arc<dyn ResultBackend>>,
     registry: Arc<Registry>,
     claimed: ClaimedJob,
-    max_attempts: u32,
-    nack_delay: Duration,
+    retry_policy: RetryPolicy,
 ) -> Result<()> {
     let job = claimed.job;
     let claim_token = claimed.claim_token;
@@ -278,12 +273,13 @@ async fn process_one(
 
     if is_success {
         Worker::settle_ack(&broker, &job_id, &claim_token).await?;
-    } else if attempts < max_attempts {
+    } else if attempts < retry_policy.max_attempts {
+        let delay = retry_policy.delay_for_attempt(attempts);
         Worker::settle_nack(
             &broker,
             &job_id,
             &claim_token,
-            NackAction::RequeueAfter { delay: nack_delay },
+            NackAction::RequeueAfter { delay },
         )
         .await?;
     } else {

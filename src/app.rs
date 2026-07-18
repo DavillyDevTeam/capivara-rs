@@ -7,10 +7,9 @@ use crate::error::{CapivaraError, Result};
 use crate::job::{Job, JobId, QueueName};
 use crate::registry::Registry;
 use crate::result::{JobResult, ResultBackend};
+use crate::retry::RetryPolicy;
 use crate::task::Task;
-use crate::worker::{
-    DEFAULT_CONCURRENCY, DEFAULT_LEASE, DEFAULT_MAX_ATTEMPTS, DEFAULT_NACK_DELAY, Worker,
-};
+use crate::worker::{DEFAULT_CONCURRENCY, DEFAULT_LEASE, Worker};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -22,8 +21,7 @@ pub struct App {
     results: Option<Arc<dyn ResultBackend>>,
     default_queue: QueueName,
     lease: Duration,
-    max_attempts: u32,
-    nack_delay: Duration,
+    retry_policy: RetryPolicy,
     concurrency: usize,
 }
 
@@ -36,8 +34,7 @@ impl App {
             results: None,
             default_queue: QueueName::default(),
             lease: DEFAULT_LEASE,
-            max_attempts: DEFAULT_MAX_ATTEMPTS,
-            nack_delay: DEFAULT_NACK_DELAY,
+            retry_policy: RetryPolicy::default(),
             concurrency: DEFAULT_CONCURRENCY,
         }
     }
@@ -59,17 +56,32 @@ impl App {
         self
     }
 
-    /// Max claim attempts before a failure is terminal (default 3).
+    /// Full retry / nack requeue policy (exponential backoff + jitter).
     ///
-    /// Values below 1 are clamped to 1 (every claim is at least one attempt).
-    pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
-        self.max_attempts = max_attempts.max(1);
+    /// `max_attempts` below 1 is clamped to 1.
+    pub fn with_retry_policy(mut self, mut policy: RetryPolicy) -> Self {
+        policy.max_attempts = policy.max_attempts.max(1);
+        self.retry_policy = policy;
         self
     }
 
-    /// Delay before requeue after a retryable failure (default 5s).
+    /// Max claim attempts before a failure is terminal (default 3).
+    ///
+    /// Values below 1 are clamped to 1 (every claim is at least one attempt).
+    /// Convenience for [`RetryPolicy::max_attempts`]; use
+    /// [`Self::with_retry_policy`] for full control.
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.retry_policy.max_attempts = max_attempts.max(1);
+        self
+    }
+
+    /// Sets [`RetryPolicy::base_delay`] used for exponential backoff (default 1s).
+    ///
+    /// For simple configs this approximates a fixed nack delay when
+    /// `max_attempts` is small and jitter is disabled; full control (cap,
+    /// jitter, base) is via [`Self::with_retry_policy`].
     pub fn with_nack_delay(mut self, nack_delay: Duration) -> Self {
-        self.nack_delay = nack_delay;
+        self.retry_policy.base_delay = nack_delay;
         self
     }
 
@@ -126,9 +138,9 @@ impl App {
 
     /// Process pending jobs in-process until the queue is empty (or `max_jobs`).
     ///
-    /// Uses configured lease / max_attempts / nack_delay / concurrency. Delayed
-    /// nacks are not waited on in a single drain pass — call again after the
-    /// delay for retries.
+    /// Uses configured lease / [`RetryPolicy`] / concurrency. Delayed nacks are
+    /// not waited on in a single drain pass — call again after the delay for
+    /// retries.
     pub async fn run_worker(&self, max_jobs: Option<usize>) -> Result<usize> {
         let registry = {
             let guard = self.registry.lock().await;
@@ -141,8 +153,7 @@ impl App {
             results: self.results.clone(),
             queues: vec![self.default_queue.clone()],
             lease: self.lease,
-            max_attempts: self.max_attempts,
-            nack_delay: self.nack_delay,
+            retry_policy: self.retry_policy,
             concurrency: self.concurrency,
         };
         worker.run(max_jobs).await

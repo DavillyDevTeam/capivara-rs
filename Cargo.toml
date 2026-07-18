@@ -25,6 +25,7 @@ thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 uuid = { version = "1.23.4", features = ["v4", "serde"] }
 redis = { version = "0.27", optional = true, default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+rand = "0.8"
 
 [lib]
 name = "capivara"

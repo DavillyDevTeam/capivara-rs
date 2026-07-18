@@ -4,7 +4,7 @@
 
 use capivara::{
     App, Broker, CapivaraError, Job, JobId, JobResult, MemoryBroker, MemoryResultBackend,
-    QueueName, Task, TaskError,
+    QueueName, RetryPolicy, Task, TaskError,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -485,16 +485,23 @@ async fn lease_expires_then_reclaimed() {
 async fn worker_retries_failure_then_terminal_ack() {
     use std::time::{Duration, Instant};
 
-    let nack_delay = Duration::from_millis(50);
+    // Deterministic policy: no jitter, fixed base so sleeps match exact delays.
+    // attempt=1 → 50ms, attempt=2 → 100ms, attempt=3 → terminal.
+    let base_delay = Duration::from_millis(50);
+    let policy = RetryPolicy {
+        max_attempts: 3,
+        base_delay,
+        max_delay: Duration::from_secs(60),
+        jitter: false,
+    };
     let app = App::new(MemoryBroker::new())
         .with_result_backend(MemoryResultBackend::new())
-        .with_max_attempts(3)
-        .with_nack_delay(nack_delay);
+        .with_retry_policy(policy);
     app.register::<Fails>().await.unwrap();
 
     let id = app.send::<Fails>(&Empty).await.unwrap();
 
-    // Drain until 3 attempts with a generous deadline (avoids tight sleep races).
+    // Drain until 3 attempts with a generous deadline.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut total = 0usize;
     while total < 3 && Instant::now() < deadline {
@@ -502,8 +509,9 @@ async fn worker_retries_failure_then_terminal_ack() {
         if total >= 3 {
             break;
         }
-        // Wait at least the nack delay for delayed requeue to become claimable.
-        tokio::time::sleep(nack_delay + Duration::from_millis(30)).await;
+        // Sleep the exact delay for the attempt just completed (total is claim count).
+        let wait = policy.delay_for_attempt(total as u32) + Duration::from_millis(20);
+        tokio::time::sleep(wait).await;
     }
     assert_eq!(total, 3, "should process 3 attempts before deadline");
 
@@ -526,11 +534,16 @@ async fn worker_retries_failure_then_terminal_ack() {
 async fn worker_retries_panic_then_terminal_ack() {
     use std::time::{Duration, Instant};
 
-    let nack_delay = Duration::from_millis(50);
+    let base_delay = Duration::from_millis(50);
+    let policy = RetryPolicy {
+        max_attempts: 3,
+        base_delay,
+        max_delay: Duration::from_secs(60),
+        jitter: false,
+    };
     let app = App::new(MemoryBroker::new())
         .with_result_backend(MemoryResultBackend::new())
-        .with_max_attempts(3)
-        .with_nack_delay(nack_delay);
+        .with_retry_policy(policy);
     app.register::<Panics>().await.unwrap();
 
     let id = app.send::<Panics>(&Empty).await.unwrap();
@@ -542,7 +555,8 @@ async fn worker_retries_panic_then_terminal_ack() {
         if total >= 3 {
             break;
         }
-        tokio::time::sleep(nack_delay + Duration::from_millis(30)).await;
+        let wait = policy.delay_for_attempt(total as u32) + Duration::from_millis(20);
+        tokio::time::sleep(wait).await;
     }
     assert_eq!(total, 3);
 
