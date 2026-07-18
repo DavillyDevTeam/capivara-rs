@@ -13,6 +13,7 @@ use crate::worker::{DEFAULT_CONCURRENCY, DEFAULT_LEASE, Worker};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 /// Capivara application: registry + broker + optional result backend.
 pub struct App {
@@ -157,18 +158,33 @@ impl App {
         let mut job = Job::new(T::NAME, payload);
         job.queue = self.default_queue.clone();
         job.idempotency_key = idempotency_key;
-        self.broker.enqueue(job).await
+
+        let span = tracing::info_span!(
+            "capivara.enqueue",
+            job.id = %job.id,
+            task.name = T::NAME,
+            queue = job.queue.as_str(),
+            attempt = job.attempts,
+        );
+        async move { self.broker.enqueue(job).await }
+            .instrument(span)
+            .await
     }
 
     /// Fetch a stored result. Errors if no backend is configured.
     pub async fn get_result(&self, id: JobId) -> Result<JobResult> {
-        let Some(backend) = &self.results else {
-            return Err(CapivaraError::NoResultBackend);
-        };
-        match backend.get(&id).await? {
-            Some(r) => Ok(r),
-            None => Err(CapivaraError::ResultNotFound { id: id.to_string() }),
+        let span = tracing::info_span!("capivara.get_result", job.id = %id);
+        async move {
+            let Some(backend) = &self.results else {
+                return Err(CapivaraError::NoResultBackend);
+            };
+            match backend.get(&id).await? {
+                Some(r) => Ok(r),
+                None => Err(CapivaraError::ResultNotFound { id: id.to_string() }),
+            }
         }
+        .instrument(span)
+        .await
     }
 
     /// Process pending jobs in-process until the queue is empty (or `max_jobs`).
