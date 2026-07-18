@@ -14,6 +14,17 @@ Stabilize the shared `Broker` contract and land an **experimental** RabbitMQ spi
 
 ### Added
 
+#### Sync / blocking task bridge (M4-3)
+
+- [`SyncTask`](src/task_sync.rs): define synchronous handlers (`fn run` → `Result`); a
+  blanket [`Task`] impl schedules the body on Tokio's blocking pool via
+  `tokio::task::spawn_blocking`. Typed `register` / `send` work unchanged.
+- [`run_blocking`](src/task_sync.rs): free helper for hybrid async `Task::run` bodies
+  that need a blocking section without implementing `SyncTask`.
+- Example `examples/sync_task.rs`; tests in `tests/task_sync_roundtrip.rs` and unit
+  tests in `src/task_sync.rs`. README DX section **Blocking / sync tasks**.
+- No `#[task]` proc-macro (optional M4-4 skipped).
+
 #### Experimental RabbitMQ broker spike (M4-2)
 
 - Opt-in Cargo feature **`rabbitmq`**: [`RabbitBroker`] / [`RabbitConfig`] via
