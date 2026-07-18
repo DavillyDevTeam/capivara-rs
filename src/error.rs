@@ -47,6 +47,11 @@ pub enum CapivaraError {
     /// Invariant violation or unexpected internal state (e.g. concurrency bookkeeping).
     #[error("internal error: {message}")]
     Internal { message: String },
+
+    /// Prometheus scrape HTTP server install/bind failure (`metrics-http` feature).
+    #[cfg(feature = "metrics-http")]
+    #[error("metrics HTTP server error: {message}")]
+    MetricsHttp { message: String },
 }
 
 /// Convenience alias for library results.
