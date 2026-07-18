@@ -14,11 +14,12 @@
 use crate::broker::{Broker, ClaimToken, ClaimedJob, NackAction};
 use crate::error::{CapivaraError, Result};
 use crate::job::{JobId, QueueName};
+use crate::metrics::{self, CompletionStatus, JobDurationTimer};
 use crate::registry::Registry;
 use crate::result::{JobResult, ResultBackend};
 use crate::retry::RetryPolicy;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tracing::Instrument;
@@ -131,10 +132,16 @@ impl Worker {
                 }
             };
 
+            // Label claim-wait by the first queue we poll (App usually has one).
+            let claim_queue_label = queues[0].as_str().to_string();
+            let claim_started = Instant::now();
             // Span only on a real claim: empty Ok(None) polls are common in drain
             // and would flood INFO with Empty fields. Fields are set at creation
             // (not late-recorded after the instrumented future ends).
-            match self.broker.claim(&queues, self.lease, DEFAULT_BLOCK).await {
+            let claim_outcome = self.broker.claim(&queues, self.lease, DEFAULT_BLOCK).await;
+            metrics::record_claim_wait(&claim_queue_label, claim_started);
+
+            match claim_outcome {
                 Ok(Some(claimed)) => {
                     let claim_span = tracing::info_span!(
                         "capivara.claim",
@@ -186,6 +193,10 @@ impl Worker {
     }
 
     /// Ack; treat lost ownership as non-fatal so the drain keeps going.
+    ///
+    /// Returns `Ok(true)` if ownership was confirmed and the claim was acked.
+    /// Returns `Ok(false)` if the claim was already lost (`JobNotFound`) so the
+    /// caller can skip completion metrics (mirrors [`Self::settle_dead_letter`]).
     async fn settle_ack(
         broker: &Arc<dyn Broker>,
         id: &JobId,
@@ -193,7 +204,7 @@ impl Worker {
         task_name: &str,
         queue: &str,
         attempt: u32,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let span = tracing::info_span!(
             "capivara.ack",
             job.id = %id,
@@ -203,8 +214,8 @@ impl Worker {
         );
         async {
             match broker.ack(id, claim_token).await {
-                Ok(()) => Ok(()),
-                Err(CapivaraError::JobNotFound { .. }) => Ok(()),
+                Ok(()) => Ok(true),
+                Err(CapivaraError::JobNotFound { .. }) => Ok(false),
                 Err(e) => Err(e),
             }
         }
@@ -213,6 +224,10 @@ impl Worker {
     }
 
     /// Nack; treat lost ownership as non-fatal so the drain keeps going.
+    ///
+    /// Returns `Ok(true)` if ownership was confirmed and the nack applied.
+    /// Returns `Ok(false)` if the claim was already lost (`JobNotFound`) so the
+    /// caller can skip completion metrics (mirrors [`Self::settle_dead_letter`]).
     async fn settle_nack(
         broker: &Arc<dyn Broker>,
         id: &JobId,
@@ -221,7 +236,7 @@ impl Worker {
         task_name: &str,
         queue: &str,
         attempt: u32,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let span = tracing::info_span!(
             "capivara.nack",
             job.id = %id,
@@ -231,8 +246,8 @@ impl Worker {
         );
         async {
             match broker.nack(id, claim_token, action).await {
-                Ok(()) => Ok(()),
-                Err(CapivaraError::JobNotFound { .. }) => Ok(()),
+                Ok(()) => Ok(true),
+                Err(CapivaraError::JobNotFound { .. }) => Ok(false),
                 Err(e) => Err(e),
             }
         }
@@ -315,6 +330,8 @@ async fn process_one(
     let job_id = job.id;
     let task_name = job.task_name.clone();
     let queue = job.queue.as_str().to_string();
+    // Histogram on drop covers success, failure, dead, and early returns.
+    let _duration = JobDurationTimer::start(task_name.clone());
 
     let handle_span = tracing::info_span!(
         "capivara.handle",
@@ -342,6 +359,7 @@ async fn process_one(
                 )
                 .await?;
                 if owned {
+                    metrics::record_completed(&queue, &task_name, CompletionStatus::Dead);
                     if let Some(backend) = &results {
                         backend
                             .store(&job_id, JobResult::Failure { message })
@@ -378,14 +396,26 @@ async fn process_one(
                         .store(&job_id, JobResult::Success { payload })
                         .await?;
                 }
-                Worker::settle_ack(&broker, &job_id, &claim_token, &task_name, &queue, attempts)
-                    .await?;
+                // Only count success when this claim still owned the settle
+                // (lost-lease JobNotFound is a no-op; another claim may complete).
+                let owned = Worker::settle_ack(
+                    &broker,
+                    &job_id,
+                    &claim_token,
+                    &task_name,
+                    &queue,
+                    attempts,
+                )
+                .await?;
+                if owned {
+                    metrics::record_completed(&queue, &task_name, CompletionStatus::Success);
+                }
             }
             JobResult::Failure { message } => {
                 if attempts < retry_policy.max_attempts {
                     // Intermediate retry: do **not** store Failure.
                     let delay = retry_policy.delay_for_attempt(attempts);
-                    Worker::settle_nack(
+                    let owned = Worker::settle_nack(
                         &broker,
                         &job_id,
                         &claim_token,
@@ -395,6 +425,9 @@ async fn process_one(
                         attempts,
                     )
                     .await?;
+                    if owned {
+                        metrics::record_completed(&queue, &task_name, CompletionStatus::Failure);
+                    }
                 } else {
                     // Terminal: dead_letter first; store Failure only if we still own
                     // the claim (avoids Failure while another claim may still run).
@@ -409,6 +442,7 @@ async fn process_one(
                     )
                     .await?;
                     if owned {
+                        metrics::record_completed(&queue, &task_name, CompletionStatus::Dead);
                         if let Some(backend) = &results {
                             backend
                                 .store(&job_id, JobResult::Failure { message })

@@ -13,10 +13,10 @@ Instructions for humans and coding agents working on this repository.
 
 ```text
 src/
-  lib.rs app.rs job.rs error.rs task.rs registry.rs
+  lib.rs app.rs job.rs error.rs task.rs registry.rs metrics.rs
   broker/  result/  worker/
 tests/
-  memory_roundtrip.rs
+  memory_roundtrip.rs  metrics_record.rs
 ```
 
 ## Commands

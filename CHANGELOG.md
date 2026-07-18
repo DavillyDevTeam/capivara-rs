@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Metrics via `metrics` facade (M3-2)
+
+- Always-on [`metrics`](https://docs.rs/metrics) dependency (facade only; no recorder/HTTP forced).
+- Counters/histograms (Prometheus-ready names; never label by `job_id`):
+  - `capivara_jobs_enqueued_total{queue,task_name}`
+  - `capivara_jobs_completed_total{queue,task_name,status=success|failure|dead}`
+  - `capivara_job_duration_seconds{task_name}`
+  - `capivara_claim_wait_seconds{queue}`
+  - `capivara_queue_depth{queue}` — best-effort; **Memory** updates from pending length;
+    **Redis does not LLEN** on the hot path
+- Wired at `App` enqueue and Worker claim/completion paths (`src/metrics.rs` helpers).
+- Unit + integration tests with `metrics-util` `DebuggingRecorder`.
+- README **Observability → Metrics** note; scrape endpoint deferred to M3-3.
+
 #### Tracing spans (M3-1)
 
 - Always-on [`tracing`](https://docs.rs/tracing) dependency (facade only; no subscriber forced).

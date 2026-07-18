@@ -65,6 +65,7 @@ mod app;
 mod broker;
 mod error;
 mod job;
+pub mod metrics;
 mod registry;
 mod result;
 mod retry;

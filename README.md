@@ -13,7 +13,7 @@ a universal CLI that runs arbitrary remote code.
 | **Package** | `capivara` (repo: [`capivara-rs`](https://github.com/DavillyDevTeam/capivara-rs)) |
 | **Org** | [DavillyDevTeam](https://github.com/DavillyDevTeam) |
 | **License** | MIT OR Apache-2.0 |
-| **Status** | **M3-1** tracing spans on core paths; M2 reliability complete; M1 Memory + Redis + concurrency |
+| **Status** | **M3-2** metrics facade + M3-1 tracing; M2 reliability complete; M1 Memory + Redis + concurrency |
 
 ## What works today (M0–M3)
 
@@ -36,6 +36,8 @@ a universal CLI that runs arbitrary remote code.
 - Panic isolation at the task boundary (worker keeps going)
 - **`tracing`** spans on core paths (`capivara.enqueue`, `claim`, `handle`, `ack`, `nack`,
   `dead_letter`, `get_result`) — library emits only; apps install a subscriber
+- **`metrics`** facade counters/histograms (Prometheus-ready names; no scrape server yet) —
+  library emits only; apps install a recorder/exporter
 - CI: fmt, clippy, tests (least-privilege permissions + concurrency)
 - Dependabot for Cargo / Actions; secret scanning enabled on the repo
 
@@ -181,6 +183,8 @@ app.run_worker(None).await?;
 
 ## Observability
 
+### Tracing
+
 Capivara depends on the [`tracing`](https://docs.rs/tracing) facade and emits **spans**
 on the main job lifecycle paths. It does **not** install a global subscriber — your
 application (or binary) chooses the exporter.
@@ -214,14 +218,38 @@ tracing_subscriber::fmt()
 // RUST_LOG=capivara=info,info cargo run
 ```
 
-Prometheus metrics are planned for a later M3 slice — not in this release.
+### Metrics
+
+Capivara depends on the [`metrics`](https://docs.rs/metrics) facade and emits
+Prometheus-friendly counters/histograms/gauges. It does **not** install a global
+recorder or HTTP scrape endpoint (scrape server is a later M3 slice). Wire an
+exporter in your binary (e.g. `metrics-exporter-prometheus`).
+
+| Metric | Type | Labels |
+|---|---|---|
+| `capivara_jobs_enqueued_total` | counter | `queue`, `task_name` |
+| `capivara_jobs_completed_total` | counter | `queue`, `task_name`, `status` |
+| `capivara_job_duration_seconds` | histogram | `task_name` |
+| `capivara_claim_wait_seconds` | histogram | `queue` |
+| `capivara_queue_depth` | gauge | `queue` (best-effort) |
+
+`status` values: `success` (acked), `failure` (nacked for retry), `dead` (dead-lettered).
+Each is recorded only when settle confirms claim ownership (lost-lease races do not inflate counters).
+
+**Cardinality:** never label by `job_id`.
+
+**Queue depth:** `MemoryBroker` updates the gauge from in-process pending length
+(cheap). Redis does **not** call `LLEN` on the claim/enqueue hot path (documented
+as costly under load). Sample depth out-of-band if you need it for Redis.
+
+Constants and helpers live in [`capivara::metrics`](src/metrics.rs).
 
 ## Not yet
 
 - DLQ replay / redrive API
 - Proc-macro or `app.task("name", fn)` sugar
 - crates.io publish (`publish = false` until then)
-- Prometheus / metrics export (M3-2)
+- HTTP `/metrics` scrape endpoint (M3-3)
 
 ## Quick example
 
