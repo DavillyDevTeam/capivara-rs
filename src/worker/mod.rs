@@ -131,24 +131,19 @@ impl Worker {
                 }
             };
 
-            let claim_span = tracing::info_span!(
-                "capivara.claim",
-                job.id = tracing::field::Empty,
-                task.name = tracing::field::Empty,
-                queue = tracing::field::Empty,
-                attempt = tracing::field::Empty,
-            );
-            let claim_outcome =
-                async { self.broker.claim(&queues, self.lease, DEFAULT_BLOCK).await }
-                    .instrument(claim_span.clone())
-                    .await;
-
-            match claim_outcome {
+            // Span only on a real claim: empty Ok(None) polls are common in drain
+            // and would flood INFO with Empty fields. Fields are set at creation
+            // (not late-recorded after the instrumented future ends).
+            match self.broker.claim(&queues, self.lease, DEFAULT_BLOCK).await {
                 Ok(Some(claimed)) => {
-                    claim_span.record("job.id", tracing::field::display(claimed.job.id));
-                    claim_span.record("task.name", claimed.job.task_name.as_str());
-                    claim_span.record("queue", claimed.job.queue.as_str());
-                    claim_span.record("attempt", claimed.job.attempts);
+                    let claim_span = tracing::info_span!(
+                        "capivara.claim",
+                        job.id = %claimed.job.id,
+                        task.name = claimed.job.task_name.as_str(),
+                        queue = claimed.job.queue.as_str(),
+                        attempt = claimed.job.attempts,
+                    );
+                    let _enter = claim_span.enter();
 
                     let broker = Arc::clone(&self.broker);
                     let results = self.results.clone();
@@ -360,7 +355,10 @@ async fn process_one(
         let payload = job.payload;
 
         // Isolate panics: spawn catches unwind as JoinError.
-        let join = tokio::spawn(async move { handler(payload).await });
+        // Propagate `capivara.handle` so spans inside Task::run parent correctly
+        // (tokio::spawn would otherwise drop the tracing context).
+        let handle_ctx = tracing::Span::current();
+        let join = tokio::spawn(async move { handler(payload).await }.instrument(handle_ctx));
 
         let outcome = match join.await {
             Ok(Ok(bytes)) => JobResult::Success { payload: bytes },

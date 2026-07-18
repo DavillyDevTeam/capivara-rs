@@ -188,8 +188,8 @@ application (or binary) chooses the exporter.
 | Span name | Where |
 |---|---|
 | `capivara.enqueue` | `App::send` / `send_with_idempotency_key` |
-| `capivara.claim` | Worker claim loop |
-| `capivara.handle` | Task handler execution |
+| `capivara.claim` | Worker claim loop (only when a job is claimed; empty polls are silent) |
+| `capivara.handle` | Per-job process (handler + settle); duration is full processing, not pure handler CPU |
 | `capivara.ack` | Successful settle |
 | `capivara.nack` | Retry requeue settle |
 | `capivara.dead_letter` | Terminal DLQ settle |
@@ -197,6 +197,11 @@ application (or binary) chooses the exporter.
 
 Common fields (when available): `job.id`, `task.name`, `queue`, `attempt`.
 Payloads and secrets (e.g. Redis URL passwords) are **never** logged.
+
+Raw `App::broker().enqueue` is intentionally **uninstrumented** (escape hatch) — prefer
+`App::send` / `send_with_idempotency_key` if you want `capivara.enqueue` spans. Handler
+futures spawned for panic isolation re-attach the current `capivara.handle` span so
+app-authored spans inside `Task::run` still parent correctly.
 
 Minimal app-side setup with the usual env filter:
 
