@@ -1,11 +1,16 @@
-//! Broker abstraction — put/get jobs.
+//! Broker abstraction — put/get jobs behind a pluggable trait.
 //!
-//! Celery analogy: Kombu / Redis transport.
+//! Celery analogy: Kombu / Redis transport (shape only, not protocol interop).
 //! - M0/default: [`memory::MemoryBroker`] (single-process).
 //! - Feature `redis`: [`redis_broker::RedisBroker`] (multi-process capable).
+//! - Next (experimental, separate PR): RabbitMQ spike — not implemented here.
+//! - Kafka is **not planned**.
 //!
 //! Terminal failures go to a **per-queue dead-letter list** via
-//! [`Broker::dead_letter`] (job body retained for inspect; no replay in M2).
+//! [`Broker::dead_letter`] (job body retained for inspect; no replay API).
+//!
+//! **Capability matrix** (Memory vs Redis, Rabbit placeholder):
+//! see crate docs `docs/BROKER.md`.
 
 mod memory;
 #[cfg(feature = "redis")]
@@ -83,6 +88,19 @@ pub struct DeadLetter {
 /// Transport for job messages.
 ///
 /// Uses `async_trait` so `dyn Broker` stays object-safe for `App`.
+///
+/// # Stabilized multi-broker contract
+///
+/// Memory and Redis implement the full capability matrix (enqueue, claim+block,
+/// lease/recover, delayed nack, DLQ, `list_dead`, producer idempotency). New
+/// backends should match that matrix or document gaps. See `docs/BROKER.md`.
+///
+/// # Settle rules
+///
+/// - `ack` — successful handler settle.
+/// - `nack` — retry path ([`NackAction::RequeueAfter`]); not terminal.
+/// - `dead_letter` — terminal path; body retained for [`Broker::list_dead`].
+/// - All three require a matching [`ClaimToken`] from the active claim.
 #[async_trait]
 pub trait Broker: Send + Sync {
     /// Enqueue a job; returns its id.
@@ -105,8 +123,8 @@ pub trait Broker: Send + Sync {
     /// - `block_for`: max time to wait for a job. Zero means non-blocking
     ///   (return `Ok(None)` immediately if empty).
     ///
-    /// On each claim loop iteration brokers recover expired leases, then promote
-    /// due delayed jobs, then try to claim.
+    /// On each claim loop iteration brokers **recover expired leases**, then
+    /// **promote due delayed jobs**, then try to claim.
     ///
     /// The returned [`ClaimedJob::claim_token`] must be used for subsequent
     /// `ack` / `nack` / `dead_letter` of this claim.
@@ -127,7 +145,9 @@ pub trait Broker: Send + Sync {
 
     /// Negative-ack: requeue according to `action` (retry path; not terminal).
     ///
-    /// Succeeds only when `claim_token` matches the active claim.
+    /// Memory and Redis both honor [`NackAction::RequeueAfter`] delays (in-process
+    /// delayed list vs delayed ZSET). Succeeds only when `claim_token` matches
+    /// the active claim.
     async fn nack(&self, id: &JobId, claim_token: &ClaimToken, action: NackAction) -> Result<()>;
 
     /// Move a claimed job to the per-queue dead-letter list and clear the claim.
@@ -135,6 +155,7 @@ pub trait Broker: Send + Sync {
     /// Keeps the job body for inspect via [`Broker::list_dead`]. `reason` is a
     /// short human-readable cause (e.g. max attempts exhausted, unknown task).
     /// Succeeds only when `claim_token` matches the active claim.
+    /// There is **no replay / redrive API** in current milestones.
     async fn dead_letter(&self, id: &JobId, claim_token: &ClaimToken, reason: &str) -> Result<()>;
 
     /// List dead-lettered jobs for `queue` (oldest first). Inspect-only; no replay.

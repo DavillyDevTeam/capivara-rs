@@ -1,7 +1,8 @@
 # Architecture
 
-High-level topology and component map for **capivara** (M0–M3). Delivery promises live in
-[guarantees.md](guarantees.md); this file is the structural map.
+High-level topology and component map for **capivara** (M0–M3; M4 multi-broker path).
+Delivery promises live in [guarantees.md](guarantees.md); broker capability matrix in
+[BROKER.md](BROKER.md); this file is the structural map.
 
 ---
 
@@ -53,6 +54,7 @@ flowchart LR
 - **Memory** is for tests and single-process apps — not shared across OS processes.
 - **Redis** shares the same `RedisConfig` (`url` + `prefix`) between producer and worker.
 - Omitting a result backend is intentional **fire-and-forget** (`get_result` → `NoResultBackend`).
+- Full capability checklist (and Rabbit next / Kafka not planned): [BROKER.md](BROKER.md).
 
 ---
 
@@ -153,6 +155,8 @@ App wiring snippets: README [Observability](../README.md#observability).
 - Exactly-once execution end-to-end
 - DLQ automatic redrive / replay API
 - Cross-process Memory broker
+- **Kafka** broker (not planned; Rabbit experimental spike is next — see [BROKER.md](BROKER.md))
 - crates.io publish while `publish = false` (discuss **0.1.0** with the maintainer after M3)
 
-When topology or guarantees change, update this file, [guarantees.md](guarantees.md), and the README together.
+When topology or guarantees change, update this file, [guarantees.md](guarantees.md),
+[BROKER.md](BROKER.md), and the README together.

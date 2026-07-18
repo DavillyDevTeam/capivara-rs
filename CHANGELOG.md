@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### M4 multi-broker path (in progress)
+
+Stabilize the shared `Broker` contract before an experimental RabbitMQ spike.
+**Kafka is not planned.** Package remains **`0.0.1`** with **`publish = false`**.
+
+### Added
+
+#### Broker capability matrix (M4-1)
+
+- [`docs/BROKER.md`](docs/BROKER.md): frozen capability matrix for **Memory** vs **Redis**
+  (enqueue, claim+block, lease/recover, delayed nack, DLQ, `list_dead`, producer
+  `idempotency_key`, multi-process, queue-depth metric) plus **RabbitMQ spike**
+  placeholders and explicit **Kafka not planned**.
+- `Broker` trait / module docs: multi-broker contract, settle rules, claim loop order
+  (recover → promote delayed → claim); no API breaks.
+- README links to the matrix; “Not yet” notes experimental Rabbit next.
+
 ### M3 observability suite (complete)
 
 End-to-end observability for the library shape: **`tracing`** spans on lifecycle paths,

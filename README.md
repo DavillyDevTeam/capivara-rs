@@ -13,7 +13,7 @@ a universal CLI that runs arbitrary remote code.
 | **Package** | `capivara` (repo: [`capivara-rs`](https://github.com/DavillyDevTeam/capivara-rs)) |
 | **Org** | [DavillyDevTeam](https://github.com/DavillyDevTeam) |
 | **License** | MIT OR Apache-2.0 |
-| **Status** | **M3 complete** (tracing + metrics + optional scrape); M2 reliability; M1 Memory + Redis |
+| **Status** | **M3 complete**; M4 multi-broker path started (Broker capability matrix frozen); Memory + Redis |
 
 ## Architecture
 
@@ -58,6 +58,10 @@ flowchart LR
 
 Omit a result backend for **fire-and-forget**. Delivery is **at-least-once** — see guarantees below.
 
+**Broker capability matrix** (enqueue, claim+block, lease/recover, delayed nack, DLQ,
+`list_dead`, producer idempotency — Memory vs Redis; Rabbit next / Kafka not planned):
+[docs/BROKER.md](docs/BROKER.md).
+
 ## What works today (M0–M3)
 
 - Typed **`Task`** trait (`NAME`, `Args`, `Output`, native async `run`)
@@ -87,7 +91,8 @@ Omit a result backend for **fire-and-forget**. Delivery is **at-least-once** —
 **Delivery, retries, DLQ, results, and idempotency** are spelled out below —
 see [Failure modes in 10 minutes](#failure-modes-in-10-minutes),
 [Delivery guarantees & failure modes](#delivery-guarantees--failure-modes),
-[docs/guarantees.md](docs/guarantees.md), and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+[docs/guarantees.md](docs/guarantees.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
+and [docs/BROKER.md](docs/BROKER.md) (capability matrix).
 
 ## Failure modes in 10 minutes
 
@@ -353,6 +358,8 @@ cargo test --features metrics-http
 
 ## Not yet
 
+- **RabbitMQ broker** — experimental spike planned next (capability gaps vs Redis expected;
+  see [docs/BROKER.md](docs/BROKER.md)); **Kafka is not planned**
 - DLQ replay / redrive API
 - Proc-macro or `app.task("name", fn)` sugar
 - crates.io publish — stay at **`0.0.1`** / **`publish = false`** until the maintainer
