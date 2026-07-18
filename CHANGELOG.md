@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-queue dead-letter queue (DLQ)**: `Broker::dead_letter(id, claim_token, reason)` and
+  `Broker::list_dead(queue)` (inspect only; **no replay** in M2). Job body retained.
+  - Memory: in-process per-queue dead list with reason.
+  - Redis: `{prefix}q:{queue}:dead` LIST of job ids; `{prefix}job:{id}:dead_reason`; job body kept (no TTL in M2).
+- Public type `DeadLetter { job, reason }`.
 - **`RetryPolicy`** (shared across Memory/Redis worker paths): exponential backoff with optional
   **equal jitter**. Defaults: `max_attempts` **3**, `base_delay` **1s**, `max_delay` **15m**,
   `jitter` **true**. Worker nack delay is `delay_for_attempt(job.attempts)`.
@@ -23,21 +28,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Memory concurrency smoke test (several jobs with concurrency 4).
 - README multi-process notes (producer + worker, same prefix) and at-least-once / idempotency guidance.
 - Lease **recover-on-claim** for `RedisBroker` (Lua) and `MemoryBroker` (expired `in_flight` → pending).
-- **Claim tokens**: lease member `{queue}\x1f{id}\x1f{token}`; `ack`/`nack` require matching token so late settle cannot steal a reclaimed claim.
+- **Claim tokens**: lease member `{queue}\x1f{id}\x1f{token}`; `ack`/`nack`/`dead_letter` require matching token so late settle cannot steal a reclaimed claim.
 - Redis claim **atomically INCRs** `{prefix}attempts:{id}` with lease (attempt counter independent of body JSON).
 - Worker treats `JobNotFound` on settle as non-fatal (drain continues after lost lease).
 - Worker delayed-nack policy: task `Err`/panic retries via `nack(RequeueAfter)` until
-  `max_attempts` (default **3**), then terminal `ack`. Defaults: lease **30s**.
+  `max_attempts` (default **3**), then terminal **dead_letter**. Defaults: lease **30s**.
 - `App::with_lease` / `with_max_attempts` (clamped ≥ 1) / `with_nack_delay` for worker policy.
-- Optional Cargo feature `redis` with `RedisBroker` + `RedisResultBackend` (LIST + lease, Lua claim/ack/nack, delayed requeue).
+- Optional Cargo feature `redis` with `RedisBroker` + `RedisResultBackend` (LIST + lease, Lua claim/ack/nack/dead_letter, delayed requeue).
 - Extended `Broker` trait: `claim(queues, lease, block_for)`, `nack(RequeueAfter)`; `ClaimedJob`.
 - testcontainers Redis integration tests (`tests/redis_broker.rs`), with `REDIS_URL` override.
 - Typed `Task` trait with native async `run`, `App::register` / `send` / `run_worker` / `get_result`.
-- `MemoryBroker` and optional `MemoryResultBackend` (in-process; success and failure stored).
+- `MemoryBroker` and optional `MemoryResultBackend` (in-process; success and terminal failure stored).
 - Worker panic isolation via `tokio::spawn` join errors.
 - Integration tests for success, task error, panic isolation, missing result backend,
   bad JSON payload, `max_jobs`, `ResultNotFound`, fire-and-forget drain, unknown task name,
-  and `with_default_queue`.
+  DLQ / terminal-only Failure, retry-then-success, and `with_default_queue`.
 - `App::broker()` for shared broker access (tests / raw `Job` injection).
 - Repository skeleton: dual MIT OR Apache-2.0 license, README (WIP), security policy,
   contributing guide, GitHub Actions CI (fmt, clippy, test), Dependabot config.
@@ -45,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Terminal-only `JobResult::Failure`**: intermediate retries no longer store Failure;
+  only max-attempts exhaustion and unknown-task outcomes write Failure (if a result backend is set),
+  and only **after** a successful `dead_letter` (lost-lease races skip Failure so it stays ≈ terminal).
+- Terminal outcomes use `dead_letter` (not bare `ack`) so failed jobs are inspectable on the DLQ.
 - Nack requeue delay is no longer a fixed **5s**; it follows [`RetryPolicy`] exponential
   schedule (base **1s**, cap **15m**, equal jitter on by default).
 - Worker drain is concurrent (default 4 in-flight); claim tokens remain per-job.

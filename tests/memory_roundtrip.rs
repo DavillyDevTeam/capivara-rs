@@ -160,7 +160,7 @@ async fn concurrency_bounds_in_flight_handlers() {
 
 #[tokio::test]
 async fn task_err_stores_failure() {
-    // Single-shot terminal failure for result storage assertion.
+    // Single-shot terminal failure for result storage + DLQ assertion.
     let app = App::new(MemoryBroker::new())
         .with_result_backend(MemoryResultBackend::new())
         .with_max_attempts(1);
@@ -173,6 +173,11 @@ async fn task_err_stores_failure() {
         JobResult::Failure { message } => assert!(message.contains("boom")),
         JobResult::Success { .. } => panic!("expected failure"),
     }
+
+    let dead = app.broker().list_dead(&QueueName::default()).await.unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].job.id, id);
+    assert!(dead[0].reason.contains("boom"));
 }
 
 #[tokio::test]
@@ -233,7 +238,7 @@ async fn send_unregistered_errors() {
 async fn bad_json_payload_stores_failure() {
     // Worker deserialize path: job name matches a registered task, payload is not JSON.
     // CapivaraError::Serialize is used for both encode and decode (serde_json::Error).
-    // max_attempts=1 so a single drain ends in terminal ack (retry policy covered elsewhere).
+    // max_attempts=1 so a single drain ends in terminal dead-letter (retry policy covered elsewhere).
     let app = App::new(MemoryBroker::new())
         .with_result_backend(MemoryResultBackend::new())
         .with_max_attempts(1);
@@ -256,7 +261,7 @@ async fn bad_json_payload_stores_failure() {
         JobResult::Success { .. } => panic!("expected deserialize failure"),
     }
 
-    // Job must be acked (not stuck in-flight).
+    // Job must be dead-lettered (not stuck in-flight / not requeued).
     assert!(
         app.broker()
             .claim(
@@ -268,6 +273,9 @@ async fn bad_json_payload_stores_failure() {
             .unwrap()
             .is_none()
     );
+    let dead = app.broker().list_dead(&QueueName::default()).await.unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].job.id, id);
 }
 
 #[tokio::test]
@@ -362,7 +370,7 @@ async fn fire_and_forget_worker_acks_without_stuck_job() {
 }
 
 #[tokio::test]
-async fn unknown_task_name_on_claimed_job_is_failed_and_acked() {
+async fn unknown_task_name_on_claimed_job_is_failed_and_dead_lettered() {
     // Bypass send(): raw job with a name that was never registered.
     let app = App::new(MemoryBroker::new()).with_result_backend(MemoryResultBackend::new());
     app.register::<Add>().await.unwrap();
@@ -384,7 +392,7 @@ async fn unknown_task_name_on_claimed_job_is_failed_and_acked() {
         JobResult::Success { .. } => panic!("expected registry miss failure"),
     }
 
-    // Not stuck in-flight.
+    // Not stuck in-flight / not requeued — on the dead-letter list.
     assert!(
         app.broker()
             .claim(
@@ -396,14 +404,23 @@ async fn unknown_task_name_on_claimed_job_is_failed_and_acked() {
             .unwrap()
             .is_none()
     );
+    let dead = app.broker().list_dead(&QueueName::default()).await.unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].job.id, id);
+    assert!(
+        dead[0].reason.contains("unknown task"),
+        "unexpected DLQ reason: {}",
+        dead[0].reason
+    );
 }
 
 #[tokio::test]
-async fn unknown_task_name_without_backend_still_acks() {
-    // Registry miss with no result backend must still claim+ack (fire-and-forget drain).
+async fn unknown_task_name_without_backend_still_dead_letters() {
+    // Registry miss with no result backend must still claim+dead_letter (fire-and-forget drain).
     let app = App::new(MemoryBroker::new());
     // no result backend
     let job = Job::new("ghost", b"{}".to_vec());
+    let id = job.id;
     app.broker().enqueue(job).await.unwrap();
     let n = app.run_worker(None).await.unwrap();
     assert_eq!(n, 1);
@@ -418,6 +435,9 @@ async fn unknown_task_name_without_backend_still_acks() {
             .unwrap()
             .is_none()
     );
+    let dead = app.broker().list_dead(&QueueName::default()).await.unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].job.id, id);
 }
 
 #[tokio::test]
@@ -482,11 +502,11 @@ async fn lease_expires_then_reclaimed() {
 }
 
 #[tokio::test]
-async fn worker_retries_failure_then_terminal_ack() {
+async fn worker_retries_failure_then_dead_letter_terminal_only() {
     use std::time::{Duration, Instant};
 
     // Deterministic policy: no jitter, fixed base so sleeps match exact delays.
-    // attempt=1 → 50ms, attempt=2 → 100ms, attempt=3 → terminal.
+    // attempt=1 → 50ms, attempt=2 → 100ms, attempt=3 → terminal DLQ.
     let base_delay = Duration::from_millis(50);
     let policy = RetryPolicy {
         max_attempts: 3,
@@ -506,6 +526,14 @@ async fn worker_retries_failure_then_terminal_ack() {
     let mut total = 0usize;
     while total < 3 && Instant::now() < deadline {
         total += app.run_worker(None).await.unwrap();
+        // Intermediate attempts must not store Failure.
+        if total < 3 {
+            let err = app.get_result(id).await.unwrap_err();
+            assert!(
+                matches!(err, CapivaraError::ResultNotFound { .. }),
+                "intermediate attempt {total} should leave result empty: {err:?}"
+            );
+        }
         if total >= 3 {
             break;
         }
@@ -520,7 +548,7 @@ async fn worker_retries_failure_then_terminal_ack() {
         JobResult::Success { .. } => panic!("expected failure"),
     }
 
-    // Terminal ack — not claimable.
+    // Terminal dead-letter — not claimable, body retained on DLQ.
     assert!(
         app.broker()
             .claim(&[], Duration::from_secs(30), Duration::ZERO)
@@ -528,10 +556,15 @@ async fn worker_retries_failure_then_terminal_ack() {
             .unwrap()
             .is_none()
     );
+    let dead = app.broker().list_dead(&QueueName::default()).await.unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].job.id, id);
+    assert_eq!(dead[0].job.task_name, Fails::NAME);
+    assert!(dead[0].reason.contains("boom"));
 }
 
 #[tokio::test]
-async fn worker_retries_panic_then_terminal_ack() {
+async fn worker_retries_panic_then_dead_letter() {
     use std::time::{Duration, Instant};
 
     let base_delay = Duration::from_millis(50);
@@ -552,6 +585,13 @@ async fn worker_retries_panic_then_terminal_ack() {
     let mut total = 0usize;
     while total < 3 && Instant::now() < deadline {
         total += app.run_worker(None).await.unwrap();
+        if total < 3 {
+            let err = app.get_result(id).await.unwrap_err();
+            assert!(
+                matches!(err, CapivaraError::ResultNotFound { .. }),
+                "intermediate panic attempt {total} should leave result empty: {err:?}"
+            );
+        }
         if total >= 3 {
             break;
         }
@@ -572,6 +612,78 @@ async fn worker_retries_panic_then_terminal_ack() {
             .unwrap()
             .is_none()
     );
+    let dead = app.broker().list_dead(&QueueName::default()).await.unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].job.id, id);
+}
+
+/// Fails the first two claims, then succeeds — exercises retry without intermediate Failure.
+static FLAKY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+struct FlakyThenOk;
+
+impl Task for FlakyThenOk {
+    const NAME: &'static str = "flaky_then_ok";
+    type Args = Empty;
+    type Output = Empty;
+
+    async fn run(_args: Self::Args) -> Result<Self::Output, TaskError> {
+        let n = FLAKY_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+        if n < 3 {
+            Err(TaskError::new(format!("flaky attempt {n}")))
+        } else {
+            Ok(Empty)
+        }
+    }
+}
+
+#[tokio::test]
+async fn worker_retry_then_success_no_intermediate_failure() {
+    use std::time::{Duration, Instant};
+
+    FLAKY_CALLS.store(0, Ordering::SeqCst);
+
+    let base_delay = Duration::from_millis(40);
+    let policy = RetryPolicy {
+        max_attempts: 5,
+        base_delay,
+        max_delay: Duration::from_secs(60),
+        jitter: false,
+    };
+    let app = App::new(MemoryBroker::new())
+        .with_result_backend(MemoryResultBackend::new())
+        .with_retry_policy(policy);
+    app.register::<FlakyThenOk>().await.unwrap();
+
+    let id = app.send::<FlakyThenOk>(&Empty).await.unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut total = 0usize;
+    while total < 3 && Instant::now() < deadline {
+        total += app.run_worker(None).await.unwrap();
+        if total < 3 {
+            let err = app.get_result(id).await.unwrap_err();
+            assert!(
+                matches!(err, CapivaraError::ResultNotFound { .. }),
+                "retry path must not store Failure before success: {err:?}"
+            );
+        }
+        if total >= 3 {
+            break;
+        }
+        let wait = policy.delay_for_attempt(total as u32) + Duration::from_millis(20);
+        tokio::time::sleep(wait).await;
+    }
+    assert_eq!(total, 3, "two failures + one success");
+
+    match app.get_result(id).await.unwrap() {
+        JobResult::Success { .. } => {}
+        JobResult::Failure { message } => panic!("expected success after retries: {message}"),
+    }
+
+    // Not on DLQ after eventual success.
+    let dead = app.broker().list_dead(&QueueName::default()).await.unwrap();
+    assert!(dead.is_empty(), "successful job must not be dead-lettered");
 }
 
 #[tokio::test]
@@ -614,6 +726,73 @@ async fn late_ack_after_recover_does_not_steal_new_claim() {
 
     // B still owns the claim and can settle.
     broker.ack(&id, &claim_b.claim_token).await.unwrap();
+
+    assert!(
+        broker
+            .claim(
+                &[QueueName::default()],
+                Duration::from_secs(30),
+                Duration::ZERO
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn late_dead_letter_after_recover_does_not_steal_new_claim() {
+    use std::time::Duration;
+
+    let broker = MemoryBroker::new();
+    let mut job = Job::new("add", br#"{"x":1,"y":2}"#.to_vec());
+    job.queue = QueueName::default();
+    let id = broker.enqueue(job).await.unwrap();
+
+    let short_lease = Duration::from_millis(60);
+    let claim_a = broker
+        .claim(&[QueueName::default()], short_lease, Duration::ZERO)
+        .await
+        .unwrap()
+        .expect("claim A");
+    assert_eq!(claim_a.job.id, id);
+    let token_a = claim_a.claim_token;
+
+    // Expire lease; recover-on-claim requeues; B claims with a new token.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let claim_b = broker
+        .claim(
+            &[QueueName::default()],
+            Duration::from_secs(30),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap()
+        .expect("claim B after recover");
+    assert_eq!(claim_b.job.id, id);
+    assert_ne!(token_a, claim_b.claim_token);
+
+    // Late dead_letter from A must fail and must not append a DLQ entry.
+    let err = broker
+        .dead_letter(&id, &token_a, "stale claim A")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CapivaraError::JobNotFound { .. }));
+    let dead = broker.list_dead(&QueueName::default()).await.unwrap();
+    assert!(
+        dead.is_empty(),
+        "late dead_letter must not write DLQ: {dead:?}"
+    );
+
+    // B still owns the claim and can dead-letter.
+    broker
+        .dead_letter(&id, &claim_b.claim_token, "owned by B")
+        .await
+        .unwrap();
+    let dead = broker.list_dead(&QueueName::default()).await.unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].job.id, id);
+    assert_eq!(dead[0].reason, "owned by B");
 
     assert!(
         broker

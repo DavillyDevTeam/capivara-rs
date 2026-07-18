@@ -2,8 +2,11 @@
 //!
 //! **Not multi-process:** a `MemoryBroker` is not shared across OS processes.
 //! Use [`super::RedisBroker`] (feature `redis`) for real distributed workers.
+//!
+//! Dead-lettered jobs are kept in an in-process per-queue list with reason
+//! (inspect via [`Broker::list_dead`]; no replay in M2).
 
-use crate::broker::{Broker, ClaimToken, ClaimedJob, NackAction};
+use crate::broker::{Broker, ClaimToken, ClaimedJob, DeadLetter, NackAction};
 use crate::error::{CapivaraError, Result};
 use crate::job::{Job, JobId, QueueName};
 use async_trait::async_trait;
@@ -23,6 +26,8 @@ struct Inner {
     in_flight: HashMap<uuid::Uuid, InFlight>,
     /// delayed requeue; promoted on claim when due
     delayed: Vec<(Instant, Job)>,
+    /// queue name -> dead-lettered jobs (oldest first)
+    dead: HashMap<String, Vec<DeadLetter>>,
 }
 
 struct InFlight {
@@ -163,5 +168,30 @@ impl Broker for MemoryBroker {
             }
         }
         Ok(())
+    }
+
+    async fn dead_letter(&self, id: &JobId, claim_token: &ClaimToken, reason: &str) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let matches = guard
+            .in_flight
+            .get(&id.0)
+            .is_some_and(|f| &f.token == claim_token);
+        if !matches {
+            return Err(CapivaraError::JobNotFound { id: id.to_string() });
+        }
+        let Some(InFlight { job, .. }) = guard.in_flight.remove(&id.0) else {
+            return Err(CapivaraError::JobNotFound { id: id.to_string() });
+        };
+        let q = job.queue.as_str().to_string();
+        guard.dead.entry(q).or_default().push(DeadLetter {
+            job,
+            reason: reason.to_string(),
+        });
+        Ok(())
+    }
+
+    async fn list_dead(&self, queue: &QueueName) -> Result<Vec<DeadLetter>> {
+        let guard = self.inner.lock().await;
+        Ok(guard.dead.get(queue.as_str()).cloned().unwrap_or_default())
     }
 }

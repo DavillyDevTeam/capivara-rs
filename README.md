@@ -13,9 +13,9 @@ a universal CLI that runs arbitrary remote code.
 | **Package** | `capivara` (repo: [`capivara-rs`](https://github.com/DavillyDevTeam/capivara-rs)) |
 | **Org** | [DavillyDevTeam](https://github.com/DavillyDevTeam) |
 | **License** | MIT OR Apache-2.0 |
-| **Status** | M1: Memory + optional Redis broker/results + worker concurrency |
+| **Status** | M2 (in progress): DLQ + terminal Failure; M1 Memory + Redis + concurrency |
 
-## What works today (M0 / M1)
+## What works today (M0–M2)
 
 - Typed **`Task`** trait (`NAME`, `Args`, `Output`, native async `run`)
 - **`App`**: `register` / `send` / `run_worker` / `get_result`
@@ -29,17 +29,19 @@ a universal CLI that runs arbitrary remote code.
   - **Single-process only** — not shared across OS processes; not a distributed queue
 - Optional **`RedisBroker`** + **`RedisResultBackend`** (`redis` feature)
   - LIST + lease, Lua claim/ack/nack, delayed requeue
-  - **lease recover-on-claim**, **claim tokens** (late ack/nack cannot steal a newer claim)
+  - **lease recover-on-claim**, **claim tokens** (late ack/nack/dead_letter cannot steal a newer claim)
   - results as `{prefix}result:{id}` STRING JSON with **24h TTL**
 - Worker concurrency: Tokio tasks limited by a semaphore (default **4**)
-- Worker retry policy: task `Err` / panic → store Failure →
+- Worker retry policy: task `Err` / panic → **no intermediate Failure store** →
   `nack(RequeueAfter)` with **exponential backoff + equal jitter** until
-  `max_attempts`, then terminal `ack`
-  (unknown task name is always terminal; lost-lease settle is non-fatal)
-- Claim-scoped ownership: each claim issues a `ClaimToken` required by `ack`/`nack`
+  `max_attempts`, then `dead_letter(reason)` and store terminal `Failure` only if
+  ownership was confirmed (unknown task is always terminal DLQ; lost-lease settle
+  is non-fatal and does **not** write Failure)
+- Per-queue **dead-letter list** (`Broker::dead_letter` / `list_dead`); job body kept for inspect; **no replay** in M2
+- Claim-scoped ownership: each claim issues a `ClaimToken` required by `ack`/`nack`/`dead_letter`
 - Panic isolation at the task boundary (worker keeps going)
 - Results: `send` → `JobId`; `get_result` only if a backend is configured
-  (stores **success and failure**); errors clearly if no backend / missing id
+  (stores **Success** and **terminal Failure only**); errors clearly if no backend / missing id
 - CI: fmt, clippy, tests (least-privilege permissions + concurrency)
 - Dependabot for Cargo / Actions; secret scanning enabled on the repo
 
@@ -69,7 +71,7 @@ Producer and worker are separate OS processes that share Redis:
 1. Both connect with the **same** `RedisConfig` (`url` + `prefix`).
 2. Producer: `RedisBroker` (+ optional `RedisResultBackend` if it will call `get_result`).
 3. Worker: same `RedisBroker` + same `RedisResultBackend`, `register` the same task types, then `run_worker` (or a long-running loop around it).
-4. At-least-once delivery: a crashed worker’s claim expires (default lease **30s**); **recover-on-claim** requeues the job. Tasks should be **idempotent**. Failures retry with exponential `nack` delay (`RetryPolicy`: base **1s**, max **15m**, equal jitter) up to `max_attempts` (default **3**); panics count as failures.
+4. At-least-once delivery: a crashed worker’s claim expires (default lease **30s**); **recover-on-claim** requeues the job. Tasks should be **idempotent**. Failures retry with exponential `nack` delay (`RetryPolicy`: base **1s**, max **15m**, equal jitter) up to `max_attempts` (default **3**), then dead-letter; panics count as failures. Intermediate retries do not store `JobResult::Failure`.
 
 ```rust
 // Producer process
@@ -93,7 +95,7 @@ app.run_worker(None).await?;
 
 ## Not yet
 
-- DLQ / terminal-only Failure storage (M2)
+- DLQ replay / redrive API
 - Proc-macro or `app.task("name", fn)` sugar
 - crates.io publish (`publish = false` until then)
 

@@ -1,10 +1,15 @@
-//! Worker loop: claim → run → store result? → ack or delayed nack.
+//! Worker loop: claim → run → store result? → ack / delayed nack / dead_letter.
 //!
 //! Celery analogy: the consumer process. With Redis this can run in another
 //! process than the producer; with Memory it stays in-process.
 //!
 //! Concurrency: up to N jobs run as concurrent Tokio tasks (default 4),
 //! limited by a [`tokio::sync::Semaphore`].
+//!
+//! **Result policy:** `JobResult::Failure` is stored only on **terminal**
+//! outcomes after a successful `dead_letter` (max attempts exhausted or unknown
+//! task). Intermediate retries and lost-lease races leave the result backend
+//! empty (`ResultNotFound`).
 
 use crate::broker::{Broker, ClaimToken, ClaimedJob, NackAction};
 use crate::error::{CapivaraError, Result};
@@ -44,15 +49,20 @@ impl Worker {
     ///
     /// Policy:
     /// - Success → store Success (if backend) → ack
-    /// - Err / panic → store Failure (if backend) → nack(RequeueAfter) while
-    ///   `attempts < max_attempts`, else terminal ack
-    /// - Unknown task → store Failure (if backend) → terminal ack (not retryable)
+    /// - Err / panic, `attempts < max_attempts` → **no** result store →
+    ///   nack(RequeueAfter { delay: policy.delay_for_attempt(attempts) })
+    /// - Err / panic, `attempts >= max_attempts` → dead_letter(reason), then
+    ///   store Failure **only if** dead_letter confirmed ownership
+    /// - Unknown task → dead_letter("unknown task…"), then store Failure only
+    ///   if dead_letter confirmed ownership
     ///
     /// Nack delay is computed via [`RetryPolicy::delay_for_attempt`] from the
     /// job's current claim count (`Job.attempts`).
     ///
-    /// Lost-lease `JobNotFound` from ack/nack is non-fatal (another claim may
-    /// already own the job after recover); the drain continues.
+    /// Lost-lease `JobNotFound` from ack/nack/dead_letter is non-fatal (another
+    /// claim may already own the job after recover); the drain continues and
+    /// Failure is **not** stored when dead_letter loses the race (keeps
+    /// `JobResult::Failure` ≈ terminal).
     ///
     /// Concurrency: claims while under `concurrency` and under `max_jobs`; each
     /// claimed job keeps its own [`ClaimToken`]. When the broker is empty and
@@ -188,6 +198,25 @@ impl Worker {
             Err(e) => Err(e),
         }
     }
+
+    /// Dead-letter this claim.
+    ///
+    /// Returns `Ok(true)` if ownership was confirmed and the job was moved to
+    /// the DLQ. Returns `Ok(false)` if the claim was already lost (`JobNotFound`)
+    /// so the caller can skip storing terminal Failure. Other broker errors
+    /// propagate.
+    async fn settle_dead_letter(
+        broker: &Arc<dyn Broker>,
+        id: &JobId,
+        claim_token: &ClaimToken,
+        reason: &str,
+    ) -> Result<bool> {
+        match broker.dead_letter(id, claim_token, reason).await {
+            Ok(()) => Ok(true),
+            Err(CapivaraError::JobNotFound { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Record a finished JoinSet task: always increments `processed`; stores the
@@ -217,7 +246,7 @@ fn account_join(
     }
 }
 
-/// Run a single claimed job: handler → store → ack/nack with this claim's token.
+/// Run a single claimed job: handler → ack/nack/dead_letter → (maybe) store.
 async fn process_one(
     broker: Arc<dyn Broker>,
     results: Option<Arc<dyn ResultBackend>>,
@@ -229,22 +258,22 @@ async fn process_one(
     let claim_token = claimed.claim_token;
     let attempts = job.attempts;
     let job_id = job.id;
+    let task_name = job.task_name.clone();
 
     let handler = match registry.get(&job.task_name) {
         Ok(h) => h,
         Err(e) => {
-            if let Some(backend) = &results {
-                backend
-                    .store(
-                        &job_id,
-                        JobResult::Failure {
-                            message: e.to_string(),
-                        },
-                    )
-                    .await?;
+            let message = e.to_string();
+            // Unknown task is terminal — dead-letter first so Failure ≈ ownership.
+            let reason = format!("unknown task: {task_name}");
+            let owned = Worker::settle_dead_letter(&broker, &job_id, &claim_token, &reason).await?;
+            if owned {
+                if let Some(backend) = &results {
+                    backend
+                        .store(&job_id, JobResult::Failure { message })
+                        .await?;
+                }
             }
-            // Unknown task is terminal — not a retryable handler failure.
-            Worker::settle_ack(&broker, &job_id, &claim_token).await?;
             return Ok(());
         }
     };
@@ -265,26 +294,40 @@ async fn process_one(
         },
     };
 
-    let is_success = matches!(outcome, JobResult::Success { .. });
-
-    if let Some(backend) = &results {
-        backend.store(&job_id, outcome).await?;
-    }
-
-    if is_success {
-        Worker::settle_ack(&broker, &job_id, &claim_token).await?;
-    } else if attempts < retry_policy.max_attempts {
-        let delay = retry_policy.delay_for_attempt(attempts);
-        Worker::settle_nack(
-            &broker,
-            &job_id,
-            &claim_token,
-            NackAction::RequeueAfter { delay },
-        )
-        .await?;
-    } else {
-        // Terminal failure after max attempts.
-        Worker::settle_ack(&broker, &job_id, &claim_token).await?;
+    match outcome {
+        JobResult::Success { payload } => {
+            if let Some(backend) = &results {
+                backend
+                    .store(&job_id, JobResult::Success { payload })
+                    .await?;
+            }
+            Worker::settle_ack(&broker, &job_id, &claim_token).await?;
+        }
+        JobResult::Failure { message } => {
+            if attempts < retry_policy.max_attempts {
+                // Intermediate retry: do **not** store Failure.
+                let delay = retry_policy.delay_for_attempt(attempts);
+                Worker::settle_nack(
+                    &broker,
+                    &job_id,
+                    &claim_token,
+                    NackAction::RequeueAfter { delay },
+                )
+                .await?;
+            } else {
+                // Terminal: dead_letter first; store Failure only if we still own
+                // the claim (avoids Failure while another claim may still run).
+                let owned =
+                    Worker::settle_dead_letter(&broker, &job_id, &claim_token, &message).await?;
+                if owned {
+                    if let Some(backend) = &results {
+                        backend
+                            .store(&job_id, JobResult::Failure { message })
+                            .await?;
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
